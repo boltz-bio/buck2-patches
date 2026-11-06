@@ -93,15 +93,17 @@ jobs:
       - uses: actions/checkout@v6
       - name: Apply patches/buck2 to the pinned commit
         run: scripts/apply.sh buck2
-      - name: Read the pinned Rust toolchain
-        id: toolchain
-        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' buck2/rust-toolchain.toml)" >> "${GITHUB_OUTPUT}"
-      # As upstream's release workflow installs it; buck2/rust-toolchain.toml selects it, and its
-      # components, inside the checkout.
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          targets: ${{ matrix.triple }}
+      # rustup reads buck2/rust-toolchain.toml inside the checkout, the examples
+      # included, so it installs that toolchain with the components it lists, as
+      # upstream's release workflow does. No RUSTUP_TOOLCHAIN override: under one,
+      # the example's rustc made rustup install llvm-tools-preview over files it
+      # already had. (The organization allows no third-party toolchain action.)
+      - name: Install the pinned Rust toolchain
+        working-directory: buck2
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.triple }}
+          rustc --version
       - name: Install zstd
         if: runner.os == 'macOS'
         run: brew install zstd
