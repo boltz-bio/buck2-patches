@@ -127,7 +127,7 @@ jobs:
         run: cargo build --release --bin buck2 --target ${{ matrix.triple }}
       # Metadata, converter and source-filter tests, built
       # with the release flags so they reuse the release build's dependencies.
-      - name: Test BES metadata and profiles
+      - name: Test BES and artifact API contracts
         if: runner.os == 'Linux'
         working-directory: buck2
         env:
@@ -136,6 +136,7 @@ jobs:
           cargo test --release --target ${{ matrix.triple }} -p buck2_server --lib -- bes_prefixed_client_metadata
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::scribe::tests::bazel_profile_keeps_resource_snapshots
+          cargo test --release --target ${{ matrix.triple }} -p buck2_build_api_tests --test buck2_build_api_tests interpreter::rule_defs::artifact::
       - name: Print the version
         run: buck2/target/${{ matrix.triple }}/release/buck2 --version
       # As upstream's release workflow checks each binary it builds.
@@ -144,6 +145,9 @@ jobs:
         run: |
           "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" build rust/... cpp/... python/... -v=2
           "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" kill
+      - name: Check source provenance and path-only caching
+        run: |
+          python3 scripts/check_source_paths.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
       # Mercury's check of what buck2 sends a Build Event Service, against a
       # fake server that records the stream (patch 0005). Upstream runs it on
       # Linux only.
