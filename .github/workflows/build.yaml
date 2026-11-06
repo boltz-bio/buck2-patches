@@ -1,0 +1,193 @@
+# Applies the patches to the pinned meta/buck2 commit, builds release buck2
+# binaries for Linux x86_64 and macOS arm64, and checks them. A tag named
+# <pin date>-bes.<n> also publishes them, with their sha256s and the prelude
+# of the same commit, as a GitHub release.
+
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*-bes.*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # As upstream's release build: no incremental state, which the cache would
+  # not keep anyway.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  apply:
+    name: Apply the patches
+    runs-on: ubuntu-26.04
+    outputs:
+      pin: ${{ steps.version.outputs.pin }}
+      date: ${{ steps.version.outputs.date }}
+      timestamp: ${{ steps.version.outputs.timestamp }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      # Fails, naming the patch, when one does not apply.
+      - name: Apply patches/buck2 to the pinned commit
+        run: scripts/apply.sh buck2
+      - name: Define the version
+        id: version
+        run: |
+          pin="$(tr -d '[:space:]' < patches/buck2/version.txt)"
+          date="$(TZ=UTC git -C buck2 log -1 --date=format-local:%Y-%m-%d --format=%cd "${pin}")"
+          timestamp="$(TZ=UTC git -C buck2 log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "${pin}")"
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            case "${GITHUB_REF_NAME}" in
+              "${date}"-bes.[0-9]*) ;;
+              *)
+                echo "::error title=Tag does not match the pin::tag ${GITHUB_REF_NAME} must be ${date}-bes.<n>, after the date of meta/buck2 ${pin}"
+                exit 1
+                ;;
+            esac
+            version="${GITHUB_REF_NAME}-${pin}"
+          else
+            version="${date}-bes.dev-${pin}"
+          fi
+          {
+            echo "pin=${pin}"
+            echo "date=${date}"
+            echo "timestamp=${timestamp}"
+            echo "version=${version}"
+          } | tee -a "${GITHUB_OUTPUT}"
+      # The prelude the binaries bundle, from the same tree, for repositories
+      # that check a prelude out beside the release they pin.
+      - name: Archive the prelude
+        run: |
+          mkdir artifacts
+          tar -C buck2 --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - prelude \
+            | zstd -q -19 -o artifacts/prelude.tar.zst
+          echo "${{ steps.version.outputs.pin }}" > artifacts/prelude_hash
+      - uses: actions/upload-artifact@v6
+        with:
+          name: prelude
+          path: artifacts/
+
+  build:
+    name: Build buck2 (${{ matrix.triple }})
+    needs: apply
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-15
+            triple: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apply patches/buck2 to the pinned commit
+        run: scripts/apply.sh buck2
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' buck2/rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal --target "${{ matrix.triple }}"
+          echo "RUSTUP_TOOLCHAIN=${channel}" >> "${GITHUB_ENV}"
+      - name: Install zstd
+        if: runner.os == 'macOS'
+        run: brew install zstd
+      # Dependencies only; the workspace crates build from scratch every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: buck2
+          prefix-key: buck2-release-${{ needs.apply.outputs.pin }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        working-directory: buck2
+        env:
+          BUCK2_RELEASE_TIMESTAMP: ${{ needs.apply.outputs.timestamp }}
+          BUCK2_SET_EXPLICIT_VERSION: ${{ needs.apply.outputs.version }}
+          # Upstream's release flags (.github/workflows/build_buck2.yml).
+          RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
+        run: cargo build --release --bin buck2 --target ${{ matrix.triple }}
+      - name: Print the version
+        run: buck2/target/${{ matrix.triple }}/release/buck2 --version
+      # As upstream's release workflow checks each binary it builds.
+      - name: Sanity check with examples/with_prelude
+        working-directory: buck2/examples/with_prelude
+        run: |
+          "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" build rust/... cpp/... python/... -v=2
+          "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" kill
+      # Mercury's check of what buck2 sends a Build Event Service, against a
+      # fake server that records the stream (patch 0005). Upstream runs it on
+      # Linux only.
+      - name: Check examples/bes against a recording Build Event Service
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/bes-venv"
+          "${RUNNER_TEMP}/bes-venv/bin/pip" install --quiet grpcio==1.76.0 grpcio-tools==1.76.0
+          "${RUNNER_TEMP}/bes-venv/bin/python" buck2/examples/bes/check.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
+      # The bundled prelude is the one the release ships: expand it as a
+      # repository would and compare it with the tree's.
+      - name: Check the bundled prelude against the tree's
+        if: runner.os == 'Linux'
+        run: |
+          project="${RUNNER_TEMP}/bundled-prelude"
+          mkdir -p "${project}"
+          printf '[cells]\nroot = .\nprelude = prelude\n\n[external_cells]\nprelude = bundled\n' > "${project}/.buckconfig"
+          touch "${project}/.buckroot"
+          cd "${project}"
+          "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" expand-external-cell prelude
+          "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" kill
+          diff -r "${project}/prelude" "${GITHUB_WORKSPACE}/buck2/prelude"
+      - name: Compress
+        run: |
+          mkdir artifacts
+          zstd -q -z buck2/target/${{ matrix.triple }}/release/buck2 -o artifacts/buck2-${{ matrix.triple }}.zst
+      - uses: actions/upload-artifact@v6
+        with:
+          name: buck2-${{ matrix.triple }}
+          path: artifacts/
+
+  release:
+    name: Publish the release
+    if: github.ref_type == 'tag'
+    needs:
+      - apply
+      - build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Write the sha256s
+        working-directory: artifacts
+        run: |
+          for file in buck2-*.zst prelude.tar.zst; do
+            sha256sum "${file}" | tee "${file}.sha256"
+          done
+          sha256sum buck2-*.zst prelude.tar.zst > SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          meta/buck2 [\`${{ needs.apply.outputs.pin }}\`](https://github.com/meta/buck2/commit/${{ needs.apply.outputs.pin }}) with the patches in [\`patches/buck2\`](https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/patches/buck2) at ${GITHUB_SHA}.
+
+          \`buck2 --version\`: \`${{ needs.apply.outputs.version }}\`
+
+          \`prelude.tar.zst\` is the prelude of that commit, which the binaries also bundle.
+
+          \`\`\`
+          $(cat artifacts/SHA256SUMS)
+          \`\`\`
+          NOTES
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes-file notes.md artifacts/*

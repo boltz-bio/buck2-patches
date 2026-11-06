@@ -1,0 +1,833 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jun Matsushita <jun@mercury.com>
+Date: Wed, 4 Nov 2026 17:40:38 +0000
+Subject: [PATCH 4/5] buck2: let `buck2 kill` wait for the BES server to
+ acknowledge the daemon's events
+
+`buck2 kill --bes-drain-timeout <duration>` asks the daemon to deliver what
+its event sink still holds. It then waits, up to the timeout, until the
+server has acknowledged it, and only then exits. The result names any
+invocation still unacknowledged.
+
+`buck2 debug flush-bes` does the same for finished commands without stopping
+the daemon.
+
+Without the flag a kill behaves as before. A CI runner can use it so a job's
+last build reaches the server before the runner goes away.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ app/buck2_cli_proto/build.rs                  |   1 +
+ app/buck2_cli_proto/daemon.proto              |  37 ++-
+ app/buck2_client/src/commands/clean.rs        |   8 +-
+ app/buck2_client/src/commands/kill.rs         |  18 +-
+ app/buck2_client_ctx/src/daemon/client.rs     |   1 +
+ .../src/daemon/client/connect.rs              |  15 +-
+ .../src/daemon/client/kill.rs                 | 174 ++++++++++++--
+ app/buck2_cmd_debug_client/src/flush_bes.rs   |  87 +++++++
+ app/buck2_cmd_debug_client/src/lib.rs         |   6 +
+ app/buck2_daemon/src/no_buckd.rs              |   1 +
+ app/buck2_server/src/daemon/server.rs         | 214 ++++++++++++++++--
+ 11 files changed, 522 insertions(+), 40 deletions(-)
+ create mode 100644 app/buck2_cmd_debug_client/src/flush_bes.rs
+
+diff --git a/app/buck2_cli_proto/build.rs b/app/buck2_cli_proto/build.rs
+index 75983f525c..33f4f7e81b 100644
+--- a/app/buck2_cli_proto/build.rs
++++ b/app/buck2_cli_proto/build.rs
+@@ -32,6 +32,7 @@ fn main() -> io::Result<()> {
+         .type_attribute(".", "#[derive(::allocative::Allocative)]")
+         .field_attribute("start_time", "#[serde(with = \"serialize_timestamp\")]")
+         .field_attribute("timeout", "#[serde(rename = \"timeout_us\", with = \"buck2_proto_serde::serialize_duration_as_micros\")]")
++        .field_attribute("bes_drain_timeout", "#[serde(rename = \"bes_drain_timeout_us\", with = \"buck2_proto_serde::serialize_duration_as_micros\")]")
+         .field_attribute("uptime", "#[serde(rename = \"uptime_us\", with = \"buck2_proto_serde::serialize_duration_as_micros\")]")
+         .field_attribute("delay", "#[serde(rename = \"delay_us\", with = \"buck2_proto_serde::serialize_duration_as_micros\")]")
+         .field_attribute("ProfileResponse.elapsed", "#[serde(rename = \"elapsed_us\", with = \"buck2_proto_serde::serialize_duration_as_micros\")]")
+diff --git a/app/buck2_cli_proto/daemon.proto b/app/buck2_cli_proto/daemon.proto
+index b1051c13ff..01e60c91a4 100644
+--- a/app/buck2_cli_proto/daemon.proto
++++ b/app/buck2_cli_proto/daemon.proto
+@@ -62,9 +62,40 @@ message KillRequest {
+   string reason = 1;
+   google.protobuf.Duration timeout = 2;
+   repeated string callers = 4;
++  // Before the daemon starts shutting down, it waits up to this long for the
++  // BES server to acknowledge every event and closes every stream. Unset or
++  // zero keeps the fixed five-second attempt the kill always made.
++  google.protobuf.Duration bes_drain_timeout = 5;
+ }
+ 
+-message KillResponse {}
++message KillResponse {
++  BesDrainResult bes_drain = 1;
++}
++
++message FlushBesRequest {
++  google.protobuf.Duration timeout = 1;
++}
++
++message BesStreamDrain {
++  enum Outcome {
++    ACKED = 0;
++    // The deadline passed first; the daemon holds the events and goes on
++    // sending them.
++    PENDING = 1;
++    FAILED = 2;
++  }
++  string invocation_id = 1;
++  Outcome outcome = 2;
++  uint64 unacked_events = 3;
++  string error = 4;
++}
++
++message BesDrainResult {
++  bool sink_enabled = 1;
++  repeated BesStreamDrain streams = 2;
++  // Set when the drain itself could not run to its deadline.
++  string error = 3;
++}
+ 
+ message StatusRequest {
+   bool snapshot = 1;
+@@ -1176,6 +1207,10 @@ service DaemonApi {
+   rpc Unstable_FlushPgoProfile(UnstableFlushPgoProfileRequest)
+       returns (UnstableFlushPgoProfileResponse);
+ 
++  // Sends the daemon's BES streams what they hold, closes the streams of
++  // finished commands, and waits for the server to acknowledge them.
++  rpc FlushBes(FlushBesRequest) returns (BesDrainResult);
++
+   // Requests allocator stats from the daemon.
+   rpc Unstable_AllocatorStats(UnstableAllocatorStatsRequest)
+       returns (UnstableAllocatorStatsResponse);
+diff --git a/app/buck2_client/src/commands/clean.rs b/app/buck2_client/src/commands/clean.rs
+index 1c163f92ef..015f9606a2 100644
+--- a/app/buck2_client/src/commands/clean.rs
++++ b/app/buck2_client/src/commands/clean.rs
+@@ -285,7 +285,13 @@ impl BuckSubcommand for InnerCleanCommand {
+                 StartupDeadline::duration_from_now(Duration::from_secs(10))?,
+             )
+             .await?;
+-            kill_command_impl(&lock, "`buck2 clean` was invoked", false).await?;
++            kill_command_impl(
++                &lock,
++                "`buck2 clean` was invoked",
++                false,
++                std::time::Duration::ZERO,
++            )
++            .await?;
+             Some(lock)
+         };
+         let disk_lock = TenantDiskLock::acquire(&paths.tenant_paths(), Duration::from_secs(30))
+diff --git a/app/buck2_client/src/commands/kill.rs b/app/buck2_client/src/commands/kill.rs
+index 5ad4564f89..b3557c7ebe 100644
+--- a/app/buck2_client/src/commands/kill.rs
++++ b/app/buck2_client/src/commands/kill.rs
+@@ -39,6 +39,13 @@ use buck2_core::buck2_env;
+ pub struct KillCommand {
+     #[clap(flatten)]
+     pub(crate) event_log_opts: CommonEventLogOptions,
++
++    /// Before shutting down, wait up to this long (e.g. `120s`) for the BES server to
++    /// acknowledge the daemon's build events, closing every stream. A server that
++    /// acknowledges a stream only once it ends, as BuildBuddy does, loses what it was not
++    /// sent before the daemon exits. The kill takes at most this long more than without it.
++    #[clap(long, value_name = "DURATION", default_value = "0s")]
++    bes_drain_timeout: humantime::Duration,
+ }
+ 
+ impl BuckSubcommand for KillCommand {
+@@ -60,9 +67,14 @@ impl BuckSubcommand for KillCommand {
+             )
+             .await?;
+ 
+-            return kill_command_impl(&lifecycle_lock, "`buck kill` was invoked", false)
+-                .await
+-                .into();
++            return kill_command_impl(
++                &lifecycle_lock,
++                "`buck kill` was invoked",
++                false,
++                self.bes_drain_timeout.into(),
++            )
++            .await
++            .into();
+         }
+ 
+         match connect_buckd(BuckdConnectOptions::ExistingOnly, events_ctx, paths).await {
+diff --git a/app/buck2_client_ctx/src/daemon/client.rs b/app/buck2_client_ctx/src/daemon/client.rs
+index 35205b5c6a..8e6f2ab9a6 100644
+--- a/app/buck2_client_ctx/src/daemon/client.rs
++++ b/app/buck2_client_ctx/src/daemon/client.rs
+@@ -650,6 +650,7 @@ impl FlushingBuckdClient<'_> {
+         UnstableFlushPgoProfileRequest,
+         UnstableFlushPgoProfileResponse
+     );
++    debug_method!(flush_bes, FlushBesRequest, BesDrainResult);
+     debug_method!(
+         unstable_allocator_stats,
+         UnstableAllocatorStatsRequest,
+diff --git a/app/buck2_client_ctx/src/daemon/client/connect.rs b/app/buck2_client_ctx/src/daemon/client/connect.rs
+index b115cddc26..0c9fa1ad36 100644
+--- a/app/buck2_client_ctx/src/daemon/client/connect.rs
++++ b/app/buck2_client_ctx/src/daemon/client/connect.rs
+@@ -774,14 +774,21 @@ impl BootstrapBuckdClient {
+         }
+     }
+ 
+-    pub(crate) async fn kill(&mut self, reason: &str) -> buck2_error::Result<Pid> {
+-        kill::kill(&mut self.client, &self.info, reason).await?;
++    pub(crate) async fn kill(
++        &mut self,
++        reason: &str,
++        bes_drain_timeout: Duration,
++    ) -> buck2_error::Result<Pid> {
++        kill::kill(&mut self.client, &self.info, reason, bes_drain_timeout).await?;
+         Pid::from_i64(self.info.pid)
+     }
+ 
+     async fn kill_for_constraints_mismatch(&mut self) -> buck2_error::Result<Pid> {
+-        self.kill("client expected different buckd constraints")
+-            .await
++        self.kill(
++            "client expected different buckd constraints",
++            Duration::ZERO,
++        )
++        .await
+     }
+ 
+     pub fn pid(&self) -> i64 {
+diff --git a/app/buck2_client_ctx/src/daemon/client/kill.rs b/app/buck2_client_ctx/src/daemon/client/kill.rs
+index ee95614394..1efeb0fc07 100644
+--- a/app/buck2_client_ctx/src/daemon/client/kill.rs
++++ b/app/buck2_client_ctx/src/daemon/client/kill.rs
+@@ -36,10 +36,13 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+ const KILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+ const FORCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+ 
++/// `bes_drain_timeout` is how long the daemon may wait for the BES server to acknowledge its
++/// events before it shuts down, on top of the usual bounds; zero is the plain kill.
+ pub async fn kill_command_impl(
+     lifecycle_lock: &BuckdLifecycleLock,
+     reason: &str,
+     quiet: bool,
++    bes_drain_timeout: Duration,
+ ) -> buck2_error::Result<()> {
+     let process = match BuckdProcessInfo::load_if_exists(lifecycle_lock.daemon_dir()) {
+         Ok(Some(p)) => p,
+@@ -65,7 +68,7 @@ pub async fn kill_command_impl(
+     let pid = match buckd {
+         Ok(Ok(mut buckd)) => {
+             crate::eprintln!("killing buckd server")?;
+-            Some(buckd.kill(reason).await?)
++            Some(buckd.kill(reason, bes_drain_timeout).await?)
+         }
+         Ok(Err((e, connected))) => {
+             // No time out: we just errored out. This is likely indicative that there is no
+@@ -124,10 +127,30 @@ pub async fn kill_command_impl(
+     Ok(())
+ }
+ 
++/// How long the client waits, from sending the kill request, for the daemon to answer it, for
++/// the daemon to exit before it is killed by signal, and for the whole kill. The daemon drains
++/// before it answers, so each grows by the drain timeout.
++#[derive(Debug, PartialEq, Eq)]
++struct KillBounds {
++    request: Duration,
++    graceful: Duration,
++    total: Duration,
++}
++
++fn kill_bounds(bes_drain_timeout: Duration) -> KillBounds {
++    let graceful = bes_drain_timeout + GRACEFUL_SHUTDOWN_TIMEOUT;
++    KillBounds {
++        request: bes_drain_timeout + KILL_REQUEST_TIMEOUT,
++        graceful,
++        total: graceful + FORCE_SHUTDOWN_TIMEOUT,
++    }
++}
++
+ pub(crate) async fn kill(
+     client: &mut DaemonApiClient<InterceptedService<Channel, BuckAddAuthTokenInterceptor>>,
+     info: &DaemonProcessInfo,
+     reason: &str,
++    bes_drain_timeout: Duration,
+ ) -> buck2_error::Result<()> {
+     let pid = Pid::from_i64(info.pid)?;
+     let callers = get_callers_for_kill();
+@@ -138,26 +161,39 @@ pub(crate) async fn kill(
+         reason: reason.to_owned(),
+         timeout: Some(GRACEFUL_SHUTDOWN_TIMEOUT.try_into()?),
+         callers,
++        bes_drain_timeout: if bes_drain_timeout.is_zero() {
++            None
++        } else {
++            Some(bes_drain_timeout.try_into()?)
++        },
+     }));
+-    let time_to_kill = GRACEFUL_SHUTDOWN_TIMEOUT + FORCE_SHUTDOWN_TIMEOUT;
++    let bounds = kill_bounds(bes_drain_timeout);
+     let time_req_sent = Instant::now();
+     // First we send a Kill request
+-    match tokio::time::timeout(KILL_REQUEST_TIMEOUT, request_fut).await {
++    match tokio::time::timeout(bounds.request, request_fut).await {
+         Ok(inner_result) => {
+             match inner_result {
+-                Ok(_) => loop {
+-                    if !kill::process_exists(pid)? {
+-                        return Ok(());
++                Ok(response) => {
++                    if let Some(command_result::Result::KillResponse(KillResponse {
++                        bes_drain: Some(bes_drain),
++                    })) = &response.get_ref().result
++                    {
++                        report_bes_drain(bes_drain)?;
+                     }
+-                    if Instant::now() - time_req_sent > GRACEFUL_SHUTDOWN_TIMEOUT {
+-                        crate::eprintln!(
+-                            "Timed out waiting for graceful shutdown of buck2 daemon pid {}",
+-                            pid
+-                        )?;
+-                        break;
++                    loop {
++                        if !kill::process_exists(pid)? {
++                            return Ok(());
++                        }
++                        if Instant::now() - time_req_sent > bounds.graceful {
++                            crate::eprintln!(
++                                "Timed out waiting for graceful shutdown of buck2 daemon pid {}",
++                                pid
++                            )?;
++                            break;
++                        }
++                        tokio::time::sleep(Duration::from_millis(100)).await;
+                     }
+-                    tokio::time::sleep(Duration::from_millis(100)).await;
+-                },
++                }
+                 Err(e) => {
+                     // The kill request can fail if the server is in a bad state and we cannot
+                     // authenticate to it.
+@@ -178,7 +214,7 @@ pub(crate) async fn kill(
+         }
+     };
+ 
+-    hard_kill_impl(pid, time_req_sent, time_to_kill).await
++    hard_kill_impl(pid, time_req_sent, bounds.total).await
+ }
+ 
+ pub(crate) async fn hard_kill(info: &DaemonProcessInfo) -> buck2_error::Result<()> {
+@@ -294,3 +330,111 @@ fn get_callers_for_kill() -> Vec<String> {
+ 
+     process_tree.into_iter().rev().collect()
+ }
++
++/// Prints what the daemon's BES drain left unacknowledged, and returns whether the server
++/// acknowledged everything.
++pub fn report_bes_drain(result: &BesDrainResult) -> buck2_error::Result<bool> {
++    if !result.sink_enabled {
++        crate::eprintln!("BES: this daemon sends no build events")?;
++        return Ok(true);
++    }
++    if !result.error.is_empty() {
++        crate::eprintln!("BES: the drain did not run: {}", result.error)?;
++        return Ok(false);
++    }
++    let acked = result
++        .streams
++        .iter()
++        .filter(|stream| stream.outcome() == bes_stream_drain::Outcome::Acked)
++        .count();
++    let unacked_events: u64 = result
++        .streams
++        .iter()
++        .map(|stream| stream.unacked_events)
++        .sum();
++    crate::eprintln!(
++        "BES: {} of {} streams acknowledged, {} events pending",
++        acked,
++        result.streams.len(),
++        unacked_events
++    )?;
++    for stream in &result.streams {
++        match stream.outcome() {
++            bes_stream_drain::Outcome::Acked => {}
++            bes_stream_drain::Outcome::Pending => crate::eprintln!(
++                "  {}: {} events not yet acknowledged",
++                stream.invocation_id,
++                stream.unacked_events
++            )?,
++            bes_stream_drain::Outcome::Failed => crate::eprintln!(
++                "  {}: failed with {} events not acknowledged: {}",
++                stream.invocation_id,
++                stream.unacked_events,
++                stream.error
++            )?,
++        }
++    }
++    Ok(acked == result.streams.len())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_kill_without_a_drain_keeps_its_bounds() {
++        assert_eq!(
++            kill_bounds(Duration::ZERO),
++            KillBounds {
++                request: Duration::from_secs(3),
++                graceful: Duration::from_secs(4),
++                total: Duration::from_secs(14),
++            }
++        );
++    }
++
++    #[test]
++    fn a_drain_extends_every_bound_by_its_timeout_and_no_more() {
++        assert_eq!(
++            kill_bounds(Duration::from_secs(120)),
++            KillBounds {
++                request: Duration::from_secs(123),
++                graceful: Duration::from_secs(124),
++                total: Duration::from_secs(134),
++            }
++        );
++    }
++
++    #[test]
++    fn a_drain_that_left_events_unacknowledged_is_reported_as_incomplete() {
++        let pending = BesDrainResult {
++            sink_enabled: true,
++            streams: vec![
++                BesStreamDrain {
++                    invocation_id: "a".to_owned(),
++                    outcome: bes_stream_drain::Outcome::Acked as i32,
++                    unacked_events: 0,
++                    error: String::new(),
++                },
++                BesStreamDrain {
++                    invocation_id: "b".to_owned(),
++                    outcome: bes_stream_drain::Outcome::Pending as i32,
++                    unacked_events: 7,
++                    error: String::new(),
++                },
++            ],
++            error: String::new(),
++        };
++        assert!(!report_bes_drain(&pending).unwrap());
++        let mut acked = pending.clone();
++        acked.streams.truncate(1);
++        assert!(report_bes_drain(&acked).unwrap());
++        assert!(report_bes_drain(&BesDrainResult::default()).unwrap());
++        let not_run = BesDrainResult {
++            sink_enabled: true,
++            streams: Vec::new(),
++            error: "busy".to_owned(),
++        };
++        assert!(!report_bes_drain(&not_run).unwrap());
++    }
++}
+diff --git a/app/buck2_cmd_debug_client/src/flush_bes.rs b/app/buck2_cmd_debug_client/src/flush_bes.rs
+new file mode 100644
+index 0000000000..74227bd1ba
+--- /dev/null
++++ b/app/buck2_cmd_debug_client/src/flush_bes.rs
+@@ -0,0 +1,87 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is dual-licensed under either the MIT license found in the
++ * LICENSE-MIT file in the root directory of this source tree or the Apache
++ * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
++ * of this source tree. You may select, at your option, one of the
++ * above-listed licenses.
++ */
++
++use std::time::Duration;
++
++use async_trait::async_trait;
++use buck2_cli_proto::FlushBesRequest;
++use buck2_client_ctx::client_ctx::ClientCommandContext;
++use buck2_client_ctx::common::BuckArgMatches;
++use buck2_client_ctx::common::CommonBuildConfigurationOptions;
++use buck2_client_ctx::common::CommonEventLogOptions;
++use buck2_client_ctx::common::CommonStarlarkOptions;
++use buck2_client_ctx::common::ui::CommonConsoleOptions;
++use buck2_client_ctx::daemon::client::BuckdClientConnector;
++use buck2_client_ctx::daemon::client::kill::report_bes_drain;
++use buck2_client_ctx::events_ctx::EventsCtx;
++use buck2_client_ctx::exit_result::ExitResult;
++use buck2_client_ctx::streaming::StreamingCommand;
++
++/// A running command's stream stays open, so this fails while a build runs against a server
++/// that acknowledges a stream only once it ends. Before `buck2 kill`, which closes those too,
++/// use `buck2 kill --bes-drain-timeout` instead.
++#[derive(Debug, clap::Parser)]
++pub struct FlushBesCommand {
++    /// How long to wait for the server's acknowledgements, e.g. `120s`.
++    #[clap(long, value_name = "DURATION", default_value = "60s")]
++    timeout: humantime::Duration,
++
++    #[clap(flatten)]
++    common_event_opts: CommonEventLogOptions,
++}
++
++#[async_trait(?Send)]
++impl StreamingCommand for FlushBesCommand {
++    const COMMAND_NAME: &'static str = "flush_bes";
++
++    fn existing_only() -> bool {
++        true
++    }
++
++    async fn exec_impl(
++        self,
++        buckd: &mut BuckdClientConnector,
++        _matches: BuckArgMatches<'_>,
++        _ctx: &mut ClientCommandContext<'_>,
++        events_ctx: &mut EventsCtx,
++    ) -> ExitResult {
++        let timeout: Duration = self.timeout.into();
++        let result = buckd
++            .with_flushing()
++            .flush_bes(
++                FlushBesRequest {
++                    timeout: Some(timeout.try_into()?),
++                },
++                events_ctx,
++            )
++            .await?;
++        if report_bes_drain(&result)? {
++            ExitResult::success()
++        } else {
++            ExitResult::bail("the BES server did not acknowledge every event")
++        }
++    }
++
++    fn console_opts(&self) -> &CommonConsoleOptions {
++        CommonConsoleOptions::none_ref()
++    }
++
++    fn event_log_opts(&self) -> &CommonEventLogOptions {
++        &self.common_event_opts
++    }
++
++    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
++        CommonBuildConfigurationOptions::default_ref()
++    }
++
++    fn starlark_opts(&self) -> &CommonStarlarkOptions {
++        CommonStarlarkOptions::default_ref()
++    }
++}
+diff --git a/app/buck2_cmd_debug_client/src/lib.rs b/app/buck2_cmd_debug_client/src/lib.rs
+index 09d57d9a2a..d8101ab740 100644
+--- a/app/buck2_cmd_debug_client/src/lib.rs
++++ b/app/buck2_cmd_debug_client/src/lib.rs
+@@ -25,6 +25,7 @@ use crate::dice_dump::DiceDumpCommand;
+ use crate::eval::EvalCommand;
+ use crate::exe::ExeCommand;
+ use crate::file_status::FileStatusCommand;
++use crate::flush_bes::FlushBesCommand;
+ use crate::flush_dep_files::FlushDepFilesCommand;
+ use crate::flush_pgo_profile::FlushPgoProfileCommand;
+ use crate::heap_dump::HeapDumpCommand;
+@@ -49,6 +50,7 @@ mod dice_dump;
+ mod eval;
+ mod exe;
+ mod file_status;
++mod flush_bes;
+ mod flush_dep_files;
+ mod flush_pgo_profile;
+ mod heap_dump;
+@@ -83,6 +85,9 @@ pub enum DebugCommand {
+     ChromeTrace(ChromeTraceCommand),
+     /// Flushes all dep files known to Buck2.
+     FlushDepFiles(FlushDepFilesCommand),
++    /// Closes the BES streams of finished commands; exits non-zero unless the server
++    /// acknowledged every event within `--timeout`.
++    FlushBes(FlushBesCommand),
+     /// Flush PGO profile data from the daemon to disk.
+     FlushPgoProfile(FlushPgoProfileCommand),
+     // Upload RE logs given an RE session ID
+@@ -132,6 +137,7 @@ impl DebugCommand {
+             DebugCommand::InternalVersion(cmd) => cmd.exec(matches, ctx),
+             DebugCommand::ChromeTrace(cmd) => ctx.exec(cmd, matches, events_ctx),
+             DebugCommand::FlushDepFiles(cmd) => ctx.exec(cmd, matches, events_ctx),
++            DebugCommand::FlushBes(cmd) => ctx.exec(cmd, matches, events_ctx),
+             DebugCommand::FlushPgoProfile(cmd) => ctx.exec(cmd, matches, events_ctx),
+             DebugCommand::UploadReLogs(cmd) => ctx.exec(cmd, matches, events_ctx),
+             DebugCommand::DaemonDir(cmd) => cmd.exec(matches, ctx),
+diff --git a/app/buck2_daemon/src/no_buckd.rs b/app/buck2_daemon/src/no_buckd.rs
+index 471c12508d..4c2b96594f 100644
+--- a/app/buck2_daemon/src/no_buckd.rs
++++ b/app/buck2_daemon/src/no_buckd.rs
+@@ -49,6 +49,7 @@ pub fn start_in_process_daemon(
+                     &lifecycle_lock,
+                     "A command with `--no-buckd` is invoked",
+                     true,
++                    std::time::Duration::ZERO,
+                 )
+                 .await
+             })
+diff --git a/app/buck2_server/src/daemon/server.rs b/app/buck2_server/src/daemon/server.rs
+index 3cab763626..20c6bd5f6d 100644
+--- a/app/buck2_server/src/daemon/server.rs
++++ b/app/buck2_server/src/daemon/server.rs
+@@ -55,7 +55,11 @@ use buck2_core::pattern::unparsed::UnparsedPatternPredicate;
+ use buck2_error::BuckErrorContext;
+ use buck2_error::ErrorTag;
+ use buck2_error::buck2_error;
++use buck2_events::DrainReport;
++use buck2_events::DrainScope;
+ use buck2_events::Event;
++use buck2_events::EventSinkWithStats;
++use buck2_events::StreamDrainOutcome;
+ use buck2_events::daemon_id::DaemonId;
+ use buck2_events::dispatch::EventDispatcher;
+ use buck2_events::source::ChannelEventSource;
+@@ -1024,6 +1028,87 @@ fn convert_positive_duration(proto_duration: &prost_types::Duration) -> Result<D
+         + Duration::from_nanos(proto_duration.nanos as u64))
+ }
+ 
++/// Finishes the Build Event Service streams before a kill starts the shutdown, while the
++/// daemon is still whole. A kill during a build ends in a forced shutdown that exits the
++/// process without the graceful path's cleanup, and a stream left open shows as a build
++/// running forever. Bounded, so a dead server cannot hold the kill hostage: by the drain
++/// timeout when the client asked for one, which it waits for on top of its usual three
++/// seconds, and otherwise by five seconds, of which the client waits three.
++async fn finish_bes_for_kill(
++    sink: Option<&dyn EventSinkWithStats>,
++    bes_drain_timeout: Option<Duration>,
++) -> Option<BesDrainResult> {
++    match (bes_drain_timeout, sink) {
++        (Some(drain_timeout), sink) => {
++            Some(drain_bes(sink, DrainScope::Shutdown, drain_timeout).await)
++        }
++        (None, Some(sink)) => {
++            match timeout(Duration::from_secs(5), sink.shutdown()).await {
++                Ok(Ok(())) => {}
++                Ok(Err(e)) => {
++                    tracing::warn!("remote event sink streams not finished cleanly: {:#}", e)
++                }
++                Err(_) => {
++                    tracing::warn!("timed out finishing remote event sink streams before shutdown")
++                }
++            }
++            None
++        }
++        (None, None) => None,
++    }
++}
++
++async fn drain_bes(
++    sink: Option<&dyn EventSinkWithStats>,
++    scope: DrainScope,
++    drain_timeout: Duration,
++) -> BesDrainResult {
++    let Some(sink) = sink else {
++        return BesDrainResult::default();
++    };
++    match sink.drain(scope, drain_timeout).await {
++        Ok(Some(report)) => bes_drain_result(report),
++        Ok(None) => BesDrainResult::default(),
++        Err(e) => {
++            tracing::warn!("BES drain did not run: {:#}", e);
++            BesDrainResult {
++                sink_enabled: true,
++                streams: Vec::new(),
++                error: format!("{e:#}"),
++            }
++        }
++    }
++}
++
++fn bes_drain_result(report: DrainReport) -> BesDrainResult {
++    let streams = report
++        .streams
++        .into_iter()
++        .map(|stream| {
++            let (outcome, unacked_events, error) = match stream.outcome {
++                StreamDrainOutcome::Acked => (bes_stream_drain::Outcome::Acked, 0, String::new()),
++                StreamDrainOutcome::Pending { events } => {
++                    (bes_stream_drain::Outcome::Pending, events, String::new())
++                }
++                StreamDrainOutcome::Failed { events, error } => {
++                    (bes_stream_drain::Outcome::Failed, events, error)
++                }
++            };
++            BesStreamDrain {
++                invocation_id: stream.invocation_id,
++                outcome: outcome as i32,
++                unacked_events,
++                error,
++            }
++        })
++        .collect();
++    BesDrainResult {
++        sink_enabled: true,
++        streams,
++        error: String::new(),
++    }
++}
++
+ fn error_to_command_result(e: buck2_error::Error) -> CommandResult {
+     CommandResult {
+         result: Some(command_result::Result::Error(
+@@ -1305,21 +1390,15 @@ impl DaemonApi for BuckdServer {
+                 .stop_accepting_requests
+                 .store(true, Ordering::Relaxed);
+ 
+-            // Finish the Build Event Service streams first, while the daemon is still whole. A
+-            // kill during a build ends in a forced shutdown that exits the process without the
+-            // graceful path's cleanup, and a stream left open shows as a build running forever.
+-            // Bounded, so a dead server cannot hold the kill hostage.
+-            if let Some(sink) = self.0.daemon_state.data().scribe_sink.dupe() {
+-                match timeout(Duration::from_secs(5), sink.shutdown()).await {
+-                    Ok(Ok(())) => {}
+-                    Ok(Err(e)) => {
+-                        tracing::warn!("remote event sink streams not finished cleanly: {:#}", e)
+-                    }
+-                    Err(_) => tracing::warn!(
+-                        "timed out finishing remote event sink streams before shutdown"
+-                    ),
+-                }
+-            }
++            let bes_drain_timeout = req
++                .bes_drain_timeout
++                .as_ref()
++                .map(convert_positive_duration)
++                .transpose()?
++                .filter(|drain_timeout| !drain_timeout.is_zero());
++
++            let sink = self.0.daemon_state.data().scribe_sink.dupe();
++            let bes_drain = finish_bes_for_kill(sink.as_deref(), bes_drain_timeout).await;
+ 
+             let timeout = req
+                 .timeout
+@@ -1333,7 +1412,7 @@ impl DaemonApi for BuckdServer {
+             };
+ 
+             self.0.daemon_shutdown.start_shutdown(reason, timeout);
+-            Ok(KillResponse {})
++            Ok(KillResponse { bes_drain })
+         })
+         .await
+     }
+@@ -1816,6 +1895,25 @@ impl DaemonApi for BuckdServer {
+         }))
+     }
+ 
++    async fn flush_bes(
++        &self,
++        req: Request<FlushBesRequest>,
++    ) -> Result<Response<BesDrainResult>, Status> {
++        self.check_if_accepting_requests()?;
++        let drain_timeout = req
++            .into_inner()
++            .timeout
++            .as_ref()
++            .map(convert_positive_duration)
++            .transpose()?
++            .filter(|drain_timeout| !drain_timeout.is_zero())
++            .ok_or_else(|| Status::invalid_argument("a BES flush needs a timeout above zero"))?;
++        let sink = self.0.daemon_state.data().scribe_sink.dupe();
++        Ok(Response::new(
++            drain_bes(sink.as_deref(), DrainScope::FinishedCommands, drain_timeout).await,
++        ))
++    }
++
+     async fn unstable_allocator_stats(
+         &self,
+         req: Request<UnstableAllocatorStatsRequest>,
+@@ -3283,4 +3381,88 @@ mod tests {
+             assert!(!ran.load(Ordering::SeqCst));
+         }
+     }
++    #[derive(Default)]
++    struct DrainRecordingSink {
++        calls: std::sync::Mutex<Vec<String>>,
++        drain_takes: Duration,
++    }
++
++    #[async_trait]
++    impl EventSinkWithStats for DrainRecordingSink {
++        fn to_event_sync(self: Arc<Self>) -> Arc<dyn buck2_events::EventSink> {
++            unreachable!("a kill sends no events")
++        }
++
++        fn stats(&self) -> buck2_events::EventSinkStats {
++            unreachable!("a kill reads no stats")
++        }
++
++        async fn shutdown(&self) -> buck2_error::Result<()> {
++            self.calls.lock().unwrap().push("shutdown".to_owned());
++            Ok(())
++        }
++
++        async fn drain(
++            &self,
++            scope: DrainScope,
++            timeout: Duration,
++        ) -> buck2_error::Result<Option<DrainReport>> {
++            self.calls
++                .lock()
++                .unwrap()
++                .push(format!("drain {scope:?} {timeout:?}"));
++            tokio::time::sleep(self.drain_takes).await;
++            Ok(Some(DrainReport {
++                streams: vec![buck2_events::StreamDrain {
++                    invocation_id: "slow".to_owned(),
++                    outcome: StreamDrainOutcome::Pending { events: 3 },
++                }],
++            }))
++        }
++    }
++
++    #[tokio::test]
++    async fn a_kill_without_a_drain_timeout_finishes_the_streams_as_before() {
++        let sink = DrainRecordingSink::default();
++        assert_eq!(finish_bes_for_kill(Some(&sink), None).await, None);
++        assert_eq!(*sink.calls.lock().unwrap(), vec!["shutdown".to_owned()]);
++    }
++
++    #[tokio::test]
++    async fn a_kill_with_a_drain_timeout_answers_only_once_the_drain_ends() {
++        tokio::time::pause();
++        let sink = DrainRecordingSink {
++            drain_takes: Duration::from_secs(7),
++            ..DrainRecordingSink::default()
++        };
++        let started = tokio::time::Instant::now();
++        let result = finish_bes_for_kill(Some(&sink), Some(Duration::from_secs(10)))
++            .await
++            .expect("a kill that asked for a drain gets its result");
++        // Past the five seconds a kill without a drain gives the streams.
++        assert!(started.elapsed() >= Duration::from_secs(7));
++        assert_eq!(
++            *sink.calls.lock().unwrap(),
++            vec!["drain Shutdown 10s".to_owned()]
++        );
++        assert_eq!(
++            result,
++            BesDrainResult {
++                sink_enabled: true,
++                streams: vec![BesStreamDrain {
++                    invocation_id: "slow".to_owned(),
++                    outcome: bes_stream_drain::Outcome::Pending as i32,
++                    unacked_events: 3,
++                    error: String::new(),
++                }],
++                error: String::new(),
++            }
++        );
++    }
++
++    #[tokio::test]
++    async fn a_kill_with_a_drain_timeout_and_no_sink_says_there_is_none() {
++        let result = finish_bes_for_kill(None, Some(Duration::from_secs(10))).await;
++        assert_eq!(result, Some(BesDrainResult::default()));
++    }
+ }
