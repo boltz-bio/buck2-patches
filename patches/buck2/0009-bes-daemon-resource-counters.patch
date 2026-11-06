@@ -1,0 +1,424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Demitri Nava <demitri@boltz.bio>
+Date: Fri, 6 Nov 2026 18:32:17 +0000
+Subject: [PATCH] buck2_events: add daemon CPU and RSS profile counters
+
+---
+ app/buck2_events/src/sink/bazel_converter.rs | 323 ++++++++++++++++++-
+ 1 file changed, 314 insertions(+), 9 deletions(-)
+
+diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
+index 71334ae..df74149 100644
+--- a/app/buck2_events/src/sink/bazel_converter.rs
++++ b/app/buck2_events/src/sink/bazel_converter.rs
+@@ -58,6 +58,9 @@ const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
+ const EXPLICIT_COMMAND_LINE_KEY: &str = "EXPLICIT_COMMAND_LINE";
+ const COMMAND_PROFILE_NAME: &str = "command.profile.gz";
+ const MAX_PROFILE_SPANS: usize = 50_000;
++const MAX_PROFILE_SNAPSHOTS: usize = 50_000;
++const DAEMON_CPU_PROFILE_NAME: &str = "CPU usage (Buck2 daemon, cores)";
++const DAEMON_RSS_PROFILE_NAME: &str = "Resident memory (Buck2 daemon, MiB)";
+ 
+ #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+ struct TargetKey {
+@@ -188,6 +191,13 @@ struct ProfileFallbackSpan {
+     args: serde_json::Map<String, serde_json::Value>,
+ }
+ 
++#[derive(Clone, Debug)]
++struct ProfileSnapshot {
++    timestamp_us: i64,
++    cpu_us: u64,
++    rss_bytes: Option<u64>,
++}
++
+ #[derive(Clone, Debug, Default)]
+ struct CommandProfileBuilder {
+     command_started_at_us: Option<i64>,
+@@ -195,6 +205,8 @@ struct CommandProfileBuilder {
+     open_spans: BTreeMap<u64, ProfileOpenSpan>,
+     completed_spans: Vec<ProfileCompletedSpan>,
+     dropped_spans: usize,
++    snapshots: Vec<ProfileSnapshot>,
++    dropped_snapshots: usize,
+ }
+ 
+ #[derive(Debug, Default)]
+@@ -1605,11 +1617,14 @@ impl BazelEventConverter {
+     fn convert_instant(
+         &mut self,
+         sequence_hint: i64,
+-        _event: &buck2_data::BuckEvent,
++        event: &buck2_data::BuckEvent,
+         instant: &buck2_data::InstantEvent,
+         events: &mut Vec<bep::BuildEvent>,
+     ) {
+         match instant.data.as_ref() {
++            Some(buck2_data::instant_event::Data::Snapshot(snapshot)) => {
++                self.command_profile.record_snapshot(event, snapshot);
++            }
+             Some(buck2_data::instant_event::Data::ConsoleMessage(message)) => {
+                 events.push(self.progress_event(
+                     sequence_hint,
+@@ -2771,6 +2786,66 @@ impl BazelEventConverter {
+ }
+ 
+ impl CommandProfileBuilder {
++    fn record_snapshot(&mut self, event: &buck2_data::BuckEvent, snapshot: &buck2_data::Snapshot) {
++        let Some(timestamp_us) = timestamp_micros(event.timestamp.as_ref()) else {
++            return;
++        };
++        if self.snapshots.len() >= MAX_PROFILE_SNAPSHOTS {
++            self.dropped_snapshots = self.dropped_snapshots.saturating_add(1);
++            return;
++        }
++        self.snapshots.push(ProfileSnapshot {
++            timestamp_us,
++            cpu_us: snapshot_cpu_time_us(snapshot),
++            rss_bytes: snapshot.buck2_rss,
++        });
++    }
++
++    fn resource_events(&self, base_us: i64) -> Vec<serde_json::Value> {
++        // These snapshots cover only the daemon, not local actions or remote executors.
++        let mut snapshots: Vec<_> = self.snapshots.iter().collect();
++        snapshots.sort_by_key(|snapshot| snapshot.timestamp_us);
++        let mut events = Vec::new();
++        let mut previous: Option<&ProfileSnapshot> = None;
++        for snapshot in snapshots {
++            if previous.is_some_and(|previous| previous.timestamp_us == snapshot.timestamp_us) {
++                continue;
++            }
++            let baseline = previous.replace(snapshot);
++            if snapshot.timestamp_us < base_us {
++                continue;
++            }
++            let timestamp_us = snapshot.timestamp_us.saturating_sub(base_us);
++            if let Some(rss_bytes) = snapshot.rss_bytes {
++                events.push(serde_json::json!({
++                    "name": DAEMON_RSS_PROFILE_NAME,
++                    "cat": "resource_usage",
++                    "ph": "C",
++                    "ts": timestamp_us,
++                    "pid": 1,
++                    "tid": 0,
++                    "args": { "memory": rss_bytes as f64 / (1024.0 * 1024.0) },
++                }));
++            }
++            if let Some(baseline) = baseline
++                && let Some(cpu_us) = snapshot.cpu_us.checked_sub(baseline.cpu_us)
++                && let Some(elapsed_us) = snapshot.timestamp_us.checked_sub(baseline.timestamp_us)
++                && elapsed_us > 0
++            {
++                events.push(serde_json::json!({
++                    "name": DAEMON_CPU_PROFILE_NAME,
++                    "cat": "resource_usage",
++                    "ph": "C",
++                    "ts": timestamp_us,
++                    "pid": 1,
++                    "tid": 0,
++                    "args": { "cpu": cpu_us as f64 / elapsed_us as f64 },
++                }));
++            }
++        }
++        events
++    }
++
+     fn record_span_start(
+         &mut self,
+         event: &buck2_data::BuckEvent,
+@@ -2899,7 +2974,7 @@ impl CommandProfileBuilder {
+     }
+ 
+     fn invocation_profile_gzip(&self, record: &buck2_data::InvocationRecord) -> Option<Vec<u8>> {
+-        if self.completed_spans.is_empty() {
++        if self.completed_spans.is_empty() && self.snapshots.is_empty() {
+             return None;
+         }
+         let command_duration_us = record
+@@ -2912,6 +2987,12 @@ impl CommandProfileBuilder {
+         let fallback_start = self
+             .command_started_at_us
+             .or_else(|| self.completed_spans.iter().map(|span| span.start_us).min())
++            .or_else(|| {
++                self.snapshots
++                    .iter()
++                    .map(|snapshot| snapshot.timestamp_us)
++                    .min()
++            })
+             .unwrap_or_default();
+         let command = record
+             .command_name
+@@ -3021,6 +3102,23 @@ impl CommandProfileBuilder {
+             }));
+         }
+ 
++        if self.dropped_snapshots > 0 {
++            trace_events.push(serde_json::json!({
++                "name": "profile resource snapshots dropped",
++                "cat": "profile",
++                "ph": "i",
++                "s": "g",
++                "ts": 0,
++                "pid": 1,
++                "args": {
++                    "dropped_snapshots": self.dropped_snapshots,
++                    "max_profile_snapshots": MAX_PROFILE_SNAPSHOTS,
++                },
++            }));
++        }
++        trace_events.extend(self.resource_events(base_us));
++        trace_events.sort_by_key(|event| event["ts"].as_i64().unwrap_or_default());
++
+         let mut metadata_events = vec![serde_json::json!({
+             "name": "process_name",
+             "ph": "M",
+@@ -9690,12 +9788,12 @@ mod tests {
+             metadata[0].metadata.get("COMMIT_SHA").map(String::as_str),
+             Some("abc")
+         );
+-        assert!(
+-            metadata
+-                .iter()
+-                .all(|m| m.metadata.get("DISABLE_COMMIT_STATUS_REPORTING").map(String::as_str)
+-                    == Some("true"))
+-        );
++        assert!(metadata.iter().all(|m| {
++            m.metadata
++                .get("DISABLE_COMMIT_STATUS_REPORTING")
++                .map(String::as_str)
++                == Some("true")
++        }));
+         assert!(
+             metadata[1..]
+                 .iter()
+@@ -9722,7 +9820,10 @@ mod tests {
+             vec!["//...".to_owned(), "images".to_owned()]
+         );
+         let metadata = build_metadata_from_command(&command, &BTreeMap::new());
+-        assert_eq!(metadata.get("PATTERN").map(String::as_str), Some("//... images"));
++        assert_eq!(
++            metadata.get("PATTERN").map(String::as_str),
++            Some("//... images")
++        );
+     }
+ 
+     #[test]
+@@ -12001,6 +12102,35 @@ mod tests {
+         );
+         converter.convert(5, &action_end);
+ 
++        // Receive snapshots out of order: the trace still exports chronological samples.
++        for (index, (micros, user_cpu, system_cpu, rss)) in [
++            (40_000, 25_000, 35_000, None),
++            (20_000, 10_000, 20_000, Some(64 * 1024 * 1024)),
++            (30_000, 20_000, 35_000, Some(96 * 1024 * 1024)),
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            converter.convert(
++                6 + index as i64,
++                &trace_event_at(
++                    0,
++                    0,
++                    micros,
++                    buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
++                        data: Some(buck2_data::instant_event::Data::Snapshot(Box::new(
++                            buck2_data::Snapshot {
++                                buck2_user_cpu_us: user_cpu,
++                                buck2_system_cpu_us: system_cpu,
++                                buck2_rss: rss,
++                                ..Default::default()
++                            },
++                        ))),
++                    }),
++                ),
++            );
++        }
++
+         let command_end = trace_event_at(
+             1,
+             0,
+@@ -12066,6 +12196,181 @@ mod tests {
+                 .iter()
+                 .any(|event| event["name"] == "write:main //pkg:main")
+         );
++        let counters: Vec<_> = trace_events
++            .iter()
++            .filter(|event| event["ph"] == "C")
++            .collect();
++        assert_eq!(counters.len(), 4);
++        let rss: Vec<_> = counters
++            .iter()
++            .filter(|event| event["name"] == DAEMON_RSS_PROFILE_NAME)
++            .collect();
++        assert_eq!(rss[0]["args"]["memory"], 64.0);
++        assert_eq!(rss[1]["args"]["memory"], 96.0);
++        assert_eq!(rss[0]["ts"], 20_000);
++        assert_eq!(rss[1]["ts"], 30_000);
++        let cpu: Vec<_> = counters
++            .iter()
++            .filter(|event| event["name"] == DAEMON_CPU_PROFILE_NAME)
++            .collect();
++        assert_eq!(cpu[0]["args"]["cpu"], 2.5);
++        assert_eq!(cpu[1]["args"]["cpu"], 0.5);
++        assert_eq!(cpu[0]["ts"], 30_000);
++        assert_eq!(cpu[1]["ts"], 40_000);
++        let timestamps: Vec<_> = trace_events
++            .iter()
++            .filter_map(|event| event["ts"].as_i64())
++            .collect();
++        assert!(timestamps.iter().all(|timestamp| *timestamp >= 0));
++        assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
++    }
++
++    #[test]
++    fn invocation_record_preserves_resource_profile_without_completed_spans() {
++        let mut converter = BazelEventConverter::default();
++        for micros in [0, 1_000_000] {
++            converter.convert(
++                1,
++                &trace_event_at(
++                    0,
++                    0,
++                    micros,
++                    buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
++                        data: Some(buck2_data::instant_event::Data::Snapshot(Box::new(
++                            buck2_data::Snapshot {
++                                buck2_user_cpu_us: micros as u64,
++                                buck2_rss: Some(64 * 1024 * 1024),
++                                ..Default::default()
++                            },
++                        ))),
++                    }),
++                ),
++            );
++        }
++        let events = converter.convert(
++            3,
++            &trace_event_at(
++                0,
++                0,
++                2_000_000,
++                buck2_data::buck_event::Data::Record(buck2_data::RecordEvent {
++                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
++                        buck2_data::InvocationRecord {
++                            command_name: Some("build".to_owned()),
++                            command_duration: Some(prost_types::Duration {
++                                seconds: 2,
++                                nanos: 0,
++                            }),
++                            ..Default::default()
++                        },
++                    ))),
++                }),
++            ),
++        );
++        let logs = events
++            .iter()
++            .find_map(|event| match event.payload.as_ref() {
++                Some(build_event::Payload::BuildToolLogs(logs)) => Some(logs),
++                _ => None,
++            })
++            .expect("build tool logs event");
++        let profile = decode_profile_from_logs(logs);
++        let trace_events = profile["traceEvents"].as_array().unwrap();
++        assert!(
++            trace_events
++                .iter()
++                .any(|event| event["name"] == "buck2 build")
++        );
++        assert_eq!(
++            trace_events
++                .iter()
++                .filter(|event| event["ph"] == "C")
++                .count(),
++            3
++        );
++        let cpu = trace_events
++            .iter()
++            .find(|event| event["name"] == DAEMON_CPU_PROFILE_NAME)
++            .unwrap();
++        assert_eq!(cpu["ts"], 1_000_000);
++        assert_eq!(cpu["args"]["cpu"], 1.0);
++    }
++
++    #[test]
++    fn resource_profile_skips_duplicate_times_and_cpu_resets() {
++        let profile = CommandProfileBuilder {
++            snapshots: vec![
++                ProfileSnapshot {
++                    timestamp_us: 999,
++                    cpu_us: 100,
++                    rss_bytes: Some(1024),
++                },
++                ProfileSnapshot {
++                    timestamp_us: 1000,
++                    cpu_us: 101,
++                    rss_bytes: None,
++                },
++                ProfileSnapshot {
++                    timestamp_us: 1000,
++                    cpu_us: 200,
++                    rss_bytes: Some(2048),
++                },
++                ProfileSnapshot {
++                    timestamp_us: 1010,
++                    cpu_us: 1,
++                    rss_bytes: None,
++                },
++                ProfileSnapshot {
++                    timestamp_us: 1020,
++                    cpu_us: 6,
++                    rss_bytes: None,
++                },
++            ],
++            ..Default::default()
++        };
++        let events = profile.resource_events(1000);
++        assert_eq!(events.len(), 2);
++        assert_eq!(events[0]["ts"], 0);
++        assert_eq!(events[0]["args"]["cpu"], 1.0);
++        assert_eq!(events[1]["ts"], 20);
++        assert_eq!(events[1]["args"]["cpu"], 0.5);
++        assert!(
++            events
++                .iter()
++                .all(|event| event["name"] == DAEMON_CPU_PROFILE_NAME)
++        );
++    }
++
++    #[test]
++    fn resource_profile_bounds_snapshot_retention() {
++        let mut profile = CommandProfileBuilder::default();
++        let event = trace_event_at(
++            0,
++            0,
++            0,
++            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent::default()),
++        );
++        for _ in 0..=MAX_PROFILE_SNAPSHOTS {
++            profile.record_snapshot(&event, &buck2_data::Snapshot::default());
++        }
++        assert_eq!(profile.snapshots.len(), MAX_PROFILE_SNAPSHOTS);
++        assert_eq!(profile.dropped_snapshots, 1);
++        let value: serde_json::Value =
++            serde_json::from_str(&profile.profile_json(None).unwrap()).unwrap();
++        assert!(
++            value["traceEvents"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .any(|event| {
++                    event["name"] == "profile resource snapshots dropped"
++                        && event["args"]["dropped_snapshots"] == 1
++                })
++        );
++        let mut missing_timestamp = event;
++        missing_timestamp.timestamp = None;
++        profile.record_snapshot(&missing_timestamp, &buck2_data::Snapshot::default());
++        assert_eq!(profile.dropped_snapshots, 1);
+     }
+ 
+     #[test]
