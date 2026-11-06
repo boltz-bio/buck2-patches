@@ -5,13 +5,14 @@
 
 name: Build
 
+# No pull_request trigger: the repository is public, and nothing outside it
+# runs here.
 on:
   push:
     branches:
       - main
     tags:
       - "*-bes.*"
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -19,7 +20,6 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # As upstream's release build: no incremental state, which the cache would
@@ -36,7 +36,9 @@ jobs:
       timestamp: ${{ steps.version.outputs.timestamp }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       # Fails, naming the patch, when one does not apply.
       - name: Apply patches/buck2 to the pinned commit
         run: scripts/apply.sh buck2
@@ -72,7 +74,7 @@ jobs:
           tar -C buck2 --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - prelude \
             | zstd -q -19 -o artifacts/prelude.tar.zst
           echo "${{ steps.version.outputs.pin }}" > artifacts/prelude_hash
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: prelude
           path: artifacts/
@@ -90,7 +92,9 @@ jobs:
             triple: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Apply patches/buck2 to the pinned commit
         run: scripts/apply.sh buck2
       # rustup reads buck2/rust-toolchain.toml inside the checkout, the examples
@@ -108,7 +112,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install zstd
       # Dependencies only; the workspace crates build from scratch every run.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: buck2
           prefix-key: buck2-release-${{ needs.apply.outputs.pin }}
@@ -121,14 +125,16 @@ jobs:
           # Upstream's release flags (.github/workflows/build_buck2.yml).
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
         run: cargo build --release --bin buck2 --target ${{ matrix.triple }}
-      # Patch 0006's own test, built with the release flags so it reuses the
-      # release build's dependencies.
-      - name: Test patch 0006
+      # Patch 0006's test and the Bazel converter's, 0007's among them, built
+      # with the release flags so they reuse the release build's dependencies.
+      - name: Test patches 0006 and 0007
         if: runner.os == 'Linux'
         working-directory: buck2
         env:
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
-        run: cargo test --release --target ${{ matrix.triple }} -p buck2_server --lib -- bes_prefixed_client_metadata
+        run: |
+          cargo test --release --target ${{ matrix.triple }} -p buck2_server --lib -- bes_prefixed_client_metadata
+          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter
       - name: Print the version
         run: buck2/target/${{ matrix.triple }}/release/buck2 --version
       # As upstream's release workflow checks each binary it builds.
@@ -163,14 +169,14 @@ jobs:
         run: |
           mkdir artifacts
           zstd -q -z buck2/target/${{ matrix.triple }}/release/buck2 -o artifacts/buck2-${{ matrix.triple }}.zst
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: buck2-${{ matrix.triple }}
           path: artifacts/
 
   release:
     name: Publish the release
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs:
       - apply
       - build
@@ -178,7 +184,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
           merge-multiple: true

@@ -18,6 +18,7 @@ Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, 
 | `0004-pr1600-kill-waits-for-bes-ack.patch` | [meta/buck2#1600](https://github.com/meta/buck2/pull/1600) (open) | Lets `buck2 kill` wait for the BES server to acknowledge the daemon's events (`--bes-drain-timeout`), so a CI job that kills its daemon doesn't lose the end of the stream. |
 | `0005-bes-example-check.patch` | Mercury's `bes-upstream/5-bes-ci` branch, not an open pull request | Adds `examples/bes`, which runs buck2 against a fake BES server and checks what it receives. It changes no code in the binary; CI runs it on the Linux binary. |
 | `0006-bes-metadata-and-start-deadline.patch` | Ours, not yet sent upstream | Each `--client-metadata bes_<key>=<value>` (or `BUCK2_CLIENT_METADATA` entry) becomes `<KEY>=<value>` in the command's Bazel `BuildMetadata`, so `bes_commit_sha=…` sets BuildBuddy's `COMMIT_SHA`: `[bes] build_metadata` is read once, when the daemon starts, so it can't carry a commit or branch for a daemon that outlives one CI run, as a resumed runner's does, and client metadata keys must be snake_case. `BUCK2_BES_COMMAND_START_DEADLINE_MS` in the daemon's environment shortens the 2 s each command waits for its `CommandStart` to be sent, which an unreachable server adds to every command. |
+| `0007-bes-private-by-default-and-command-line.patch` | Ours, not yet sent upstream | An invocation no longer gets `VISIBILITY=PUBLIC` when nothing sets it, so it stays private to the BES server's organization, as a Bazel invocation does; a command or `[bes] build_metadata` can still set it. Each command also sends its command line after the binary, as a JSON array, as `EXPLICIT_COMMAND_LINE`, which BuildBuddy shows on a workflow's list of the invocations it ran. |
 
 Patches 0001 to 0005 are `git format-patch` of Mercury's commits, unchanged, from the heads of its stacked pull requests (#1598's head contains #1597's commit, and so on; `bes-upstream/5-bes-ci` holds all five).
 
@@ -27,13 +28,13 @@ Things to know when configuring it:
 
 - The daemon reads `[bes]` from the root cell's `.buckconfig` files when it starts, not from `--config-file` or `-c`, and expands `$VAR` in `header` and `build_metadata` from its own environment then.
 - A `header` whose variable is unset or empty turns BES off for that daemon, so an API key in the environment can switch it on and off.
-- With `event_format = bazel`, every invocation gets `VISIBILITY=PUBLIC` in its BuildMetadata unless `build_metadata` or the command sets `VISIBILITY`, which makes it public on BuildBuddy. Set it.
+- Without patch 0007, `event_format = bazel` gives every invocation `VISIBILITY=PUBLIC` unless `build_metadata` or the command sets `VISIBILITY`, which makes it public on BuildBuddy. With it, an invocation is private unless something sets `PUBLIC`.
 
 [meta/buck2#1608](https://github.com/meta/buck2/pull/1608) (shim fix-ups) isn't carried: it fixes the bootstrap build with Buck2 itself (`buck2 build //:buck2`) on macOS and Windows, and the release builds here use Cargo, as upstream's do.
 
 ## How it builds
 
-`.github/workflows/build.yaml` runs on every push and pull request:
+`.github/workflows/build.yaml` runs on every push to `main` and every release tag, and on demand (`workflow_dispatch`). Pull requests don't run it: the repository is public, and nothing from outside it runs here.
 
 1. `scripts/apply.sh` checks out the pin and applies the patches. A patch that doesn't apply fails the run and names the patch.
 2. It builds `buck2` with upstream's release flags (`cargo build --release`, `-C codegen-units=1`, the toolchain from `rust-toolchain.toml`) on `ubuntu-26.04` and `macos-15`.
@@ -54,7 +55,7 @@ Releases are tagged `<upstream date>-bes.<n>`: the UTC commit date of the pin, t
 git tag 2026-11-06-bes.1 && git push origin 2026-11-06-bes.1
 ```
 
-The workflow refuses a tag whose date isn't the pin's. The release holds:
+The workflow refuses a tag whose date isn't the pin's. Tags can't be moved or deleted, so a release that fails takes the next number. The release holds:
 
 - `buck2-x86_64-unknown-linux-gnu.zst` and `buck2-aarch64-apple-darwin.zst`;
 - `prelude.tar.zst`, the pinned commit's `prelude/`, and `prelude_hash`, that commit;
@@ -66,7 +67,7 @@ The workflow refuses a tag whose date isn't the pin's. The release holds:
 
 1. Pick an upstream `main` commit, newer than the pin, and write it to `patches/buck2/version.txt`.
 2. Run `scripts/apply.sh /tmp/buck2`. If a patch no longer applies, rebase it: apply the ones before it, `git am --3way` it, resolve, commit, and export the series again with `git format-patch --no-signature --zero-commit -o patches/buck2 <pin>..HEAD`, keeping the file names.
-3. Open a pull request. When CI is green, merge it and tag `<new date>-bes.1`.
+3. Push it to a branch and run the workflow there (`gh workflow run build.yaml --ref <branch>`). When it's green, merge it and tag `<new date>-bes.1`.
 
 ## Dropping a patch
 

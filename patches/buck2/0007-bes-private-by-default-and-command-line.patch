@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Demitri Nava <demitri@boltz.bio>
+Date: Fri, 6 Nov 2026 16:22:48 +0000
+Subject: [PATCH] buck2_events: keep BES invocations private by default, and
+ send the command line
+
+The Bazel converter gave every invocation `VISIBILITY=PUBLIC` unless the
+command or `[bes] build_metadata` set it, which makes a BuildBuddy
+invocation readable by anyone with its link. One missing line of
+configuration published a repository's builds. A Bazel invocation is
+private to its organization unless it asks to be public.
+
+The converter now sets no VISIBILITY of its own. A command or
+`[bes] build_metadata` that sets one, `PUBLIC` included, still decides.
+
+BuildBuddy lists a workflow's commands by their `EXPLICIT_COMMAND_LINE`
+metadata, a JSON array, as its CI runner sets it for Bazel. Without it a
+card shows only flags, with no subcommand or targets. The converter now
+sets it from the command's arguments after the binary, unless the
+command sets it.
+---
+ app/buck2_events/src/sink/bazel_converter.rs | 51 ++++++++++++++++----
+ 1 file changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
+index 8bf5e30be1..be756808f2 100644
+--- a/app/buck2_events/src/sink/bazel_converter.rs
++++ b/app/buck2_events/src/sink/bazel_converter.rs
+@@ -49,8 +49,13 @@ const CANONICAL_COMMAND_LINE_LABEL: &str = "canonical";
+ const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
+ const TOOL_COMMAND_LINE_LABEL: &str = "tool";
+ const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
++// An invocation with no VISIBILITY is private to the server's organization, as Bazel's are; only
++// a command or `[bes] build_metadata` that sets it, to `PUBLIC` say, changes that.
++#[cfg(test)]
+ const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
+-const BUILDBUDDY_PUBLIC_VISIBILITY: &str = "PUBLIC";
++// What BuildBuddy shows on a child invocation's card, as Bazel's CI runner sets it: the command
++// line after the binary, as a JSON array.
++const EXPLICIT_COMMAND_LINE_KEY: &str = "EXPLICIT_COMMAND_LINE";
+ const COMMAND_PROFILE_NAME: &str = "command.profile.gz";
+ const MAX_PROFILE_SPANS: usize = 50_000;
+ 
+@@ -4184,9 +4189,13 @@ fn build_metadata_from_command(
+     if env::var("CI").is_ok_and(|ci| !ci.is_empty()) {
+         metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
+     }
+-    metadata
+-        .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
+-        .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
++    if let Some(args) = command.cli_args.get(1..).filter(|args| !args.is_empty()) {
++        if let Ok(line) = serde_json::to_string(args) {
++            metadata
++                .entry(EXPLICIT_COMMAND_LINE_KEY.to_owned())
++                .or_insert(line);
++        }
++    }
+     metadata
+ }
+ 
+@@ -4269,9 +4278,6 @@ fn build_metadata_from_invocation(
+         metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
+     }
+     metadata
+-        .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
+-        .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
+-    metadata
+ }
+ 
+ fn add_version_control_metadata(
+@@ -7839,7 +7845,7 @@ mod tests {
+                 .metadata
+                 .get(BUILDBUDDY_VISIBILITY_KEY)
+                 .map(String::as_str),
+-            Some(BUILDBUDDY_PUBLIC_VISIBILITY)
++            None
+         );
+         assert_eq!(
+             build_metadata.metadata.get("USER").map(String::as_str),
+@@ -9452,7 +9458,7 @@ mod tests {
+                 .metadata
+                 .get(BUILDBUDDY_VISIBILITY_KEY)
+                 .map(String::as_str),
+-            Some(BUILDBUDDY_PUBLIC_VISIBILITY)
++            None
+         );
+     }
+ 
+@@ -9596,6 +9602,33 @@ mod tests {
+         )));
+     }
+ 
++    #[test]
++    fn command_start_sets_the_explicit_command_line_and_no_visibility() {
++        let event = build_metadata_event(&build_metadata_from_command(
++            &buck2_data::CommandStart {
++                cli_args: vec![
++                    "/usr/bin/buck2".to_owned(),
++                    "build".to_owned(),
++                    "//a:b,c".to_owned(),
++                ],
++                ..Default::default()
++            },
++            &BTreeMap::new(),
++        ));
++        let build_metadata = match event.payload.as_ref() {
++            Some(build_event::Payload::BuildMetadata(metadata)) => metadata,
++            other => panic!("expected build metadata, got {other:?}"),
++        };
++        assert_eq!(
++            build_metadata
++                .metadata
++                .get(EXPLICIT_COMMAND_LINE_KEY)
++                .map(String::as_str),
++            Some(r#"["build","//a:b,c"]"#)
++        );
++        assert_eq!(build_metadata.metadata.get(BUILDBUDDY_VISIBILITY_KEY), None);
++    }
++
+     #[test]
+     fn command_start_preserves_explicit_buildbuddy_visibility() {
+         let event = build_metadata_event(&build_metadata_from_command(
