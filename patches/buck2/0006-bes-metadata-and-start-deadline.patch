@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Demitri Nava <demitri@boltz.bio>
+Date: Fri, 6 Nov 2026 14:26:29 +0000
+Subject: [PATCH] buck2: per-command BES build metadata, and a configurable
+ CommandStart deadline
+
+`[bes] build_metadata` is read once, when the daemon starts, so it can only
+carry values that hold for the daemon's whole life. A CI runner that resumes
+a snapshot keeps its daemon from an earlier run, so a commit, branch or
+parent invocation set there names the wrong run. Client metadata can't
+carry them either: the BES sink reads only the command's start metadata,
+and client metadata keys must be snake_case where BuildBuddy reads
+`COMMIT_SHA`, `BRANCH_NAME`, `ROLE` and `PARENT_INVOCATION_ID`.
+
+Each `--client-metadata bes_<key>=<value>` (or `BUCK2_CLIENT_METADATA`
+entry) now becomes `<KEY>=<value>` in the command's start metadata, which
+the Bazel converter merges into `BuildMetadata` over the configured
+defaults. Other client metadata is unchanged.
+
+Every command also waits up to 2 s for the sink to send its CommandStart.
+While the BES server is unreachable, refused or blackholed, that whole 2 s
+is added to every command. `BUCK2_BES_COMMAND_START_DEADLINE_MS` in the
+daemon's environment now shortens it; a send that misses the deadline
+still goes first, after it, as before.
+---
+ app/buck2_events/src/sink/scribe.rs | 18 ++++++++-
+ app/buck2_server/src/ctx.rs         | 59 +++++++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
+index 806ffa46b2..3d990acd42 100644
+--- a/app/buck2_events/src/sink/scribe.rs
++++ b/app/buck2_events/src/sink/scribe.rs
+@@ -56,6 +56,22 @@ use crate::sink::smart_truncate_event::smart_truncate_event_preserving_logs;
+ #[cfg(not(fbcode_build))]
+ const COMMAND_START_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+ 
++/// `COMMAND_START_SEND_DEADLINE`, or `BUCK2_BES_COMMAND_START_DEADLINE_MS` from the daemon's
++/// environment. Every command waits out the whole deadline while the BES server is unreachable,
++/// so a repository whose server answers within a few hundred milliseconds can shorten what an
++/// outage costs each command. A send that misses the deadline still goes first, after it.
++#[cfg(not(fbcode_build))]
++fn command_start_send_deadline() -> std::time::Duration {
++    match buck2_env!("BUCK2_BES_COMMAND_START_DEADLINE_MS", type = u64) {
++        Ok(Some(ms)) => std::time::Duration::from_millis(ms),
++        Ok(None) => COMMAND_START_SEND_DEADLINE,
++        Err(e) => {
++            tracing::warn!("{:#}", e);
++            COMMAND_START_SEND_DEADLINE
++        }
++    }
++}
++
+ // 1 MiB limit
+ static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
+ // 50k characters
+@@ -158,7 +174,7 @@ impl RemoteEventSink {
+             message_key: Some(message_key),
+         };
+         self.client
+-            .send_messages_within(vec![message], COMMAND_START_SEND_DEADLINE)
++            .send_messages_within(vec![message], command_start_send_deadline())
+     }
+ 
+     #[cfg(not(fbcode_build))]
+diff --git a/app/buck2_server/src/ctx.rs b/app/buck2_server/src/ctx.rs
+index b7e826a2db..a25e78017a 100644
+--- a/app/buck2_server/src/ctx.rs
++++ b/app/buck2_server/src/ctx.rs
+@@ -253,6 +253,8 @@ pub struct ServerCommandContext<'a> {
+     pub oncall: Option<String>,
+     /// The client ID, if one was provided via --client-metadata.
+     pub client_id_from_client_metadata: Option<String>,
++    /// Build Event Service metadata for this command, from `bes_`-prefixed --client-metadata.
++    bes_build_metadata: Vec<(String, String)>,
+ 
+     host_platform_override: HostPlatformOverride,
+     host_arch_override: HostArchOverride,
+@@ -398,6 +400,8 @@ impl<'a> ServerCommandContext<'a> {
+             .find(|m| m.key == "id")
+             .map(|m| m.value.clone());
+ 
++        let bes_build_metadata = bes_build_metadata(&client_context.client_metadata);
++
+         let heartbeat_guard_handle =
+             HeartbeatGuard::new(base_context.events.dupe(), snapshot_collector);
+ 
+@@ -434,6 +438,7 @@ impl<'a> ServerCommandContext<'a> {
+             config_overrides: client_context.config_overrides.clone(),
+             oncall,
+             client_id_from_client_metadata,
++            bes_build_metadata,
+             re_connection_handle,
+             cert_state,
+             starlark_profiling_manager,
+@@ -1369,6 +1374,27 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
+     data.data.set(ConfigMetadataHolder(metadata));
+ }
+ 
++/// The prefix of client metadata keys that become Build Event Service build metadata.
++const BES_CLIENT_METADATA_PREFIX: &str = "bes_";
++
++/// Build Event Service metadata for one command: each `--client-metadata bes_<key>=<value>`
++/// (or `BUCK2_CLIENT_METADATA` entry) becomes `<KEY>=<value>` in the command's start metadata,
++/// which the BES sink sends as Bazel `BuildMetadata`, so `bes_commit_sha=...` sets
++/// `COMMIT_SHA`. `[bes] build_metadata` is read once, when the daemon starts, so it can only
++/// hold values that stay the same for the daemon's life; these are per command. Later entries
++/// win, as for `id`.
++fn bes_build_metadata(
++    client_metadata: &[buck2_data::ClientMetadata],
++) -> Vec<(String, String)> {
++    client_metadata
++        .iter()
++        .filter_map(|m| {
++            let key = m.key.strip_prefix(BES_CLIENT_METADATA_PREFIX)?;
++            (!key.is_empty()).then(|| (key.to_ascii_uppercase(), m.value.clone()))
++        })
++        .collect()
++}
++
+ impl Drop for ServerCommandContext<'_> {
+     fn drop(&mut self) {
+         // Ensure we cancel the heartbeat guard first.
+@@ -1526,6 +1552,10 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
+             metadata.insert("client".to_owned(), client_id_from_client_metadata.clone());
+         }
+ 
++        for (key, value) in &self.bes_build_metadata {
++            metadata.insert(key.clone(), value.clone());
++        }
++
+         metadata.insert(
+             "vpnless".to_owned(),
+             self.base_context
+@@ -1609,3 +1639,32 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
+         self.command_start
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::bes_build_metadata;
++
++    fn metadata(key: &str, value: &str) -> buck2_data::ClientMetadata {
++        buck2_data::ClientMetadata {
++            key: key.to_owned(),
++            value: value.to_owned(),
++        }
++    }
++
++    #[test]
++    fn bes_prefixed_client_metadata_becomes_build_metadata() {
++        assert_eq!(
++            bes_build_metadata(&[
++                metadata("id", "ci"),
++                metadata("bes_commit_sha", "abc123"),
++                metadata("bes_parent_invocation_id", "1234-5678"),
++                metadata("bes_", "ignored"),
++                metadata("besides", "ignored"),
++            ]),
++            vec![
++                ("COMMIT_SHA".to_owned(), "abc123".to_owned()),
++                ("PARENT_INVOCATION_ID".to_owned(), "1234-5678".to_owned()),
++            ]
++        );
++    }
++}

@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/boltz-bio/buck2-patches/actions/workflows/build.yaml/badge.svg)](https://github.com/boltz-bio/buck2-patches/actions/workflows/build.yaml)
 
-[Buck2](https://github.com/meta/buck2) at a pinned upstream commit, plus the patches that make it publish its builds to a Bazel Build Event Service (BES) such as BuildBuddy's. Upstream Buck2 has no BES client, so its builds never appear as BuildBuddy invocations. The patches are Mercury's open upstream pull requests, kept here until upstream merges them.
+[Buck2](https://github.com/meta/buck2) at a pinned upstream commit, plus the patches that make it publish its builds to a Bazel Build Event Service (BES) such as BuildBuddy's. Upstream Buck2 has no BES client, so its builds never appear as BuildBuddy invocations. Most of the patches are Mercury's open upstream pull requests, kept here until upstream merges them; one is ours.
 
 Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, zstd-compressed and named as upstream names them, their sha256s, and the standard prelude from the same upstream commit, which the binaries also bundle.
 
@@ -17,8 +17,17 @@ Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, 
 | `0003-pr1599-publish-to-bazel-bes.patch` | [meta/buck2#1599](https://github.com/meta/buck2/pull/1599) (open) | Publishes the event stream to a Bazel Build Event Service in open-source builds, configured by the `[bes]` buckconfig section (`docs/users/build_observability/event_system.md`). `event_format = bazel` converts it to Bazel BEP, which BuildBuddy renders. |
 | `0004-pr1600-kill-waits-for-bes-ack.patch` | [meta/buck2#1600](https://github.com/meta/buck2/pull/1600) (open) | Lets `buck2 kill` wait for the BES server to acknowledge the daemon's events (`--bes-drain-timeout`), so a CI job that kills its daemon doesn't lose the end of the stream. |
 | `0005-bes-example-check.patch` | Mercury's `bes-upstream/5-bes-ci` branch, not an open pull request | Adds `examples/bes`, which runs buck2 against a fake BES server and checks what it receives. It changes no code in the binary; CI runs it on the Linux binary. |
+| `0006-bes-metadata-and-start-deadline.patch` | Ours, not yet sent upstream | Each `--client-metadata bes_<key>=<value>` (or `BUCK2_CLIENT_METADATA` entry) becomes `<KEY>=<value>` in the command's Bazel `BuildMetadata`, so `bes_commit_sha=…` sets BuildBuddy's `COMMIT_SHA`: `[bes] build_metadata` is read once, when the daemon starts, so it can't carry a commit or branch for a daemon that outlives one CI run, as a resumed runner's does, and client metadata keys must be snake_case. `BUCK2_BES_COMMAND_START_DEADLINE_MS` in the daemon's environment shortens the 2 s each command waits for its `CommandStart` to be sent, which an unreachable server adds to every command. |
 
-Each patch is `git format-patch` of the pull request's own commits from its head: the pull requests are stacked, so #1598's head contains #1597's commit, and so on.
+Patches 0001 to 0005 are `git format-patch` of Mercury's commits, unchanged, from the heads of its stacked pull requests (#1598's head contains #1597's commit, and so on; `bes-upstream/5-bes-ci` holds all five).
+
+The pin is `2920a4c3bc` (2026-11-06), the parent of [`b673d4d04a`](https://github.com/meta/buck2/commit/b673d4d04a), "types: The test info providers hold `ValueOf`". The patches still apply after it, but patch 0002's `test_labels` in `app/buck2_test/src/orchestrator.rs` no longer compiles there: `labels()` now yields `Result`s. Bump past it once Mercury rebases #1598, or adapt 0002 here.
+
+Things to know when configuring it:
+
+- The daemon reads `[bes]` from the root cell's `.buckconfig` files when it starts, not from `--config-file` or `-c`, and expands `$VAR` in `header` and `build_metadata` from its own environment then.
+- A `header` whose variable is unset or empty turns BES off for that daemon, so an API key in the environment can switch it on and off.
+- With `event_format = bazel`, every invocation gets `VISIBILITY=PUBLIC` in its BuildMetadata unless `build_metadata` or the command sets `VISIBILITY`, which makes it public on BuildBuddy. Set it.
 
 [meta/buck2#1608](https://github.com/meta/buck2/pull/1608) (shim fix-ups) isn't carried: it fixes the bootstrap build with Buck2 itself (`buck2 build //:buck2`) on macOS and Windows, and the release builds here use Cargo, as upstream's do.
 

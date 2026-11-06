@@ -115,6 +115,14 @@ jobs:
           # Upstream's release flags (.github/workflows/build_buck2.yml).
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
         run: cargo build --release --bin buck2 --target ${{ matrix.triple }}
+      # Patch 0006's own test, built with the release flags so it reuses the
+      # release build's dependencies.
+      - name: Test patch 0006
+        if: runner.os == 'Linux'
+        working-directory: buck2
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
+        run: cargo test --release --target ${{ matrix.triple }} -p buck2_server --lib -- bes_prefixed_client_metadata
       - name: Print the version
         run: buck2/target/${{ matrix.triple }}/release/buck2 --version
       # As upstream's release workflow checks each binary it builds.
