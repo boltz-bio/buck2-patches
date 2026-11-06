@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Demitri Nava <demitri@boltz.bio>
+Date: Fri, 6 Nov 2026 17:24:11 +0000
+Subject: [PATCH] buck2_events: start every BES stream with its command, and
+ honour a command's PATTERN
+
+When a command's ReSession or TargetCfg reached the converter before its
+CommandStart, which the sink's worker can deliver out of order, the stream
+began with a Started for an "unknown" command and a BuildMetadata holding
+only those keys. BuildBuddy then reported a GitHub commit status for it,
+before the command's own metadata said not to, and left it pending
+forever. A command run on an argfile also showed `@/path/to/argfile` as
+its pattern.
+
+The converter now holds ReSession and TargetCfg until the stream has
+started, sends the command's BuildMetadata straight after Started as Bazel
+does, ahead of anything held, and takes a command's PATTERN metadata, when
+set, as its patterns instead of its arguments.
+---
+ app/buck2_events/src/sink/bazel_converter.rs | 146 ++++++++++++++++++-
+ 1 file changed, 140 insertions(+), 6 deletions(-)
+
+diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
+index be756808f2..71334ae144 100644
+--- a/app/buck2_events/src/sink/bazel_converter.rs
++++ b/app/buck2_events/src/sink/bazel_converter.rs
+@@ -1250,6 +1250,9 @@ pub(crate) struct BazelEventConverter {
+     posted_event_ids: BTreeSet<Vec<u8>>,
+     configured_target_labels: BTreeSet<String>,
+     pending_patterns: Option<Vec<String>>,
++    // The command named its patterns in PATTERN metadata, so the labels it expands to don't
++    // replace them.
++    explicit_patterns: bool,
+     pattern_expanded_emitted: bool,
+     defer_target_setup_until_first_result: bool,
+     pending_workspace_status: Option<bep::BuildEvent>,
+@@ -1350,11 +1353,16 @@ impl BazelEventConverter {
+             );
+             self.saw_started = true;
+         } else if !self.pending_pre_start_events.is_empty() {
++            // After Started, and after the command's own BuildMetadata when it follows.
+             let insert_at = usize::from(
+                 events
+                     .first()
+                     .is_some_and(|event| event.id.as_ref() == Some(&started_id())),
+             );
++            let insert_at = insert_at
++                + usize::from(events.get(insert_at).is_some_and(|event| {
++                    matches!(event.payload, Some(build_event::Payload::BuildMetadata(_)))
++                }));
+             events.splice(
+                 insert_at..insert_at,
+                 std::mem::take(&mut self.pending_pre_start_events),
+@@ -1384,6 +1392,13 @@ impl BazelEventConverter {
+                     events.push(self.started_event(event, Some(command)));
+                     self.saw_started = true;
+                 }
++                // Right after Started, as Bazel sends it: a server decides from the first
++                // BuildMetadata whether to report a commit status, and keys such as
++                // DISABLE_COMMIT_STATUS_REPORTING come with the command.
++                events.push(build_metadata_event(&build_metadata_from_command(
++                    command,
++                    &self.build_metadata,
++                )));
+                 self.remember_cli_target_patterns(command);
+                 self.defer_target_setup_until_first_result =
+                     is_test_or_coverage_command(&command_name(command));
+@@ -1398,10 +1413,6 @@ impl BazelEventConverter {
+                     workspace_status_event(command, event.timestamp.as_ref()),
+                     events,
+                 );
+-                events.push(build_metadata_event(&build_metadata_from_command(
+-                    command,
+-                    &self.build_metadata,
+-                )));
+             }
+             Some(buck2_data::span_start_event::Data::CommandCritical(command)) => {
+                 let metadata = metadata_map_from_hash_map(&command.metadata);
+@@ -1965,11 +1976,15 @@ impl BazelEventConverter {
+     }
+ 
+     fn remember_target_patterns(&mut self, patterns: &buck2_data::ParsedTargetPatterns) {
++        if self.explicit_patterns {
++            return;
++        }
+         let patterns = target_patterns_from_invocation_record(patterns);
+         self.remember_target_pattern_values(patterns);
+     }
+ 
+     fn remember_cli_target_patterns(&mut self, command: &buck2_data::CommandStart) {
++        self.explicit_patterns = explicit_pattern(command).is_some();
+         let patterns = target_patterns_from_cli(command);
+         self.remember_target_pattern_values(patterns);
+     }
+@@ -3062,7 +3077,12 @@ fn should_buffer_before_started(event: &buck2_data::BuckEvent) -> bool {
+                         | buck2_data::instant_event::Data::TagEvent(_)
+                         | buck2_data::instant_event::Data::IoProviderInfo(_)
+                         | buck2_data::instant_event::Data::StructuredError(_)
+-                        | buck2_data::instant_event::Data::VersionControlRevision(_),
++                        | buck2_data::instant_event::Data::VersionControlRevision(_)
++                        // The remote execution session and target configuration of a command
++                        // whose CommandStart the sink's worker has not seen yet: they become
++                        // BuildMetadata, which must not open a stream as an "unknown" command.
++                        | buck2_data::instant_event::Data::ReSession(_)
++                        | buck2_data::instant_event::Data::TargetCfg(_),
+                 ),
+             }
+         ))
+@@ -4328,9 +4348,24 @@ fn build_metadata_event(metadata: &BTreeMap<String, String>) -> bep::BuildEvent
+ }
+ 
+ fn target_patterns_from_cli(command: &buck2_data::CommandStart) -> Vec<String> {
++    if let Some(pattern) = explicit_pattern(command) {
++        return pattern;
++    }
+     target_patterns_from_args(&command.cli_args, &command_name(command))
+ }
+ 
++/// The patterns a command names in its own PATTERN metadata, which a caller sets when its
++/// arguments say nothing readable, such as `@argfile` of thousands of labels.
++fn explicit_pattern(command: &buck2_data::CommandStart) -> Option<Vec<String>> {
++    let patterns: Vec<String> = command
++        .metadata
++        .get("PATTERN")?
++        .split_whitespace()
++        .map(str::to_owned)
++        .collect();
++    (!patterns.is_empty()).then_some(patterns)
++}
++
+ fn target_patterns_from_invocation(record: &buck2_data::InvocationRecord) -> Vec<String> {
+     if let Some(patterns) = record.parsed_target_patterns.as_ref() {
+         let patterns = target_patterns_from_invocation_record(patterns);
+@@ -9602,6 +9637,94 @@ mod tests {
+         )));
+     }
+ 
++    #[test]
++    fn a_re_session_before_the_command_start_waits_for_it() {
++        let mut converter = BazelEventConverter::new_with_options(
++            [(
++                "DISABLE_COMMIT_STATUS_REPORTING".to_owned(),
++                "true".to_owned(),
++            )],
++            true,
++        );
++        let session = trace_event(buck2_data::buck_event::Data::Instant(
++            buck2_data::InstantEvent {
++                data: Some(buck2_data::instant_event::Data::ReSession(
++                    buck2_data::RemoteExecutionSessionCreated {
++                        session_id: "session".to_owned(),
++                        ..Default::default()
++                    },
++                )),
++            },
++        ));
++        assert!(converter.convert(1, &session).is_empty());
++        let start = trace_event(buck2_data::buck_event::Data::SpanStart(
++            buck2_data::SpanStartEvent {
++                data: Some(buck2_data::span_start_event::Data::Command(
++                    buck2_data::CommandStart {
++                        data: Some(buck2_data::command_start::Data::Build(
++                            buck2_data::BuildCommandStart {},
++                        )),
++                        metadata: HashMap::from([("COMMIT_SHA".to_owned(), "abc".to_owned())]),
++                        ..Default::default()
++                    },
++                )),
++            },
++        ));
++        let events = converter.convert(2, &start);
++        match events.first().and_then(|event| event.payload.as_ref()) {
++            Some(build_event::Payload::Started(started)) => assert_eq!(started.command, "build"),
++            other => panic!("expected Started first, got {other:?}"),
++        }
++        let metadata: Vec<_> = events
++            .iter()
++            .filter_map(|event| match event.payload.as_ref() {
++                Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
++                _ => None,
++            })
++            .collect();
++        assert!(matches!(
++            events[1].payload,
++            Some(build_event::Payload::BuildMetadata(_))
++        ));
++        assert_eq!(
++            metadata[0].metadata.get("COMMIT_SHA").map(String::as_str),
++            Some("abc")
++        );
++        assert!(
++            metadata
++                .iter()
++                .all(|m| m.metadata.get("DISABLE_COMMIT_STATUS_REPORTING").map(String::as_str)
++                    == Some("true"))
++        );
++        assert!(
++            metadata[1..]
++                .iter()
++                .any(|m| m.metadata.contains_key("BUCK2_RE_SESSION_ID"))
++        );
++    }
++
++    #[test]
++    fn a_command_names_its_own_pattern() {
++        let command = buck2_data::CommandStart {
++            data: Some(buck2_data::command_start::Data::Build(
++                buck2_data::BuildCommandStart {},
++            )),
++            cli_args: vec![
++                "buck2".to_owned(),
++                "build".to_owned(),
++                "@/tmp/targets".to_owned(),
++            ],
++            metadata: HashMap::from([("PATTERN".to_owned(), "//... images".to_owned())]),
++            ..Default::default()
++        };
++        assert_eq!(
++            target_patterns_from_cli(&command),
++            vec!["//...".to_owned(), "images".to_owned()]
++        );
++        let metadata = build_metadata_from_command(&command, &BTreeMap::new());
++        assert_eq!(metadata.get("PATTERN").map(String::as_str), Some("//... images"));
++    }
++
+     #[test]
+     fn command_start_sets_the_explicit_command_line_and_no_visibility() {
+         let event = build_metadata_event(&build_metadata_from_command(
+@@ -11981,8 +12104,19 @@ mod tests {
+     #[test]
+     fn re_session_emits_remote_execution_metadata() {
+         let mut converter = BazelEventConverter::default();
+-        let events = converter.convert(
++        // A session before the command's start waits for it (a_re_session_before_the_command_start_waits_for_it).
++        converter.convert(
+             1,
++            &trace_event(buck2_data::buck_event::Data::SpanStart(
++                buck2_data::SpanStartEvent {
++                    data: Some(buck2_data::span_start_event::Data::Command(
++                        buck2_data::CommandStart::default(),
++                    )),
++                },
++            )),
++        );
++        let events = converter.convert(
++            2,
+             &trace_event(buck2_data::buck_event::Data::Instant(
+                 buck2_data::InstantEvent {
+                     data: Some(buck2_data::instant_event::Data::ReSession(
