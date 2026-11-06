@@ -5,7 +5,8 @@ Subject: [PATCH] buck2_events: add daemon CPU and RSS profile counters
 
 ---
  app/buck2_events/src/sink/bazel_converter.rs | 323 ++++++++++++++++++-
- 1 file changed, 314 insertions(+), 9 deletions(-)
+ app/buck2_events/src/sink/scribe.rs          |  25 ++
+ 2 files changed, 339 insertions(+), 9 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
 index 71334ae..df74149 100644
@@ -18,13 +19,13 @@ index 71334ae..df74149 100644
 +const MAX_PROFILE_SNAPSHOTS: usize = 50_000;
 +const DAEMON_CPU_PROFILE_NAME: &str = "CPU usage (Buck2 daemon, cores)";
 +const DAEMON_RSS_PROFILE_NAME: &str = "Resident memory (Buck2 daemon, MiB)";
- 
+
  #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
  struct TargetKey {
 @@ -188,6 +191,13 @@ struct ProfileFallbackSpan {
      args: serde_json::Map<String, serde_json::Value>,
  }
- 
+
 +#[derive(Clone, Debug)]
 +struct ProfileSnapshot {
 +    timestamp_us: i64,
@@ -42,7 +43,7 @@ index 71334ae..df74149 100644
 +    snapshots: Vec<ProfileSnapshot>,
 +    dropped_snapshots: usize,
  }
- 
+
  #[derive(Debug, Default)]
 @@ -1605,11 +1617,14 @@ impl BazelEventConverter {
      fn convert_instant(
@@ -62,7 +63,7 @@ index 71334ae..df74149 100644
                      sequence_hint,
 @@ -2771,6 +2786,66 @@ impl BazelEventConverter {
  }
- 
+
  impl CommandProfileBuilder {
 +    fn record_snapshot(&mut self, event: &buck2_data::BuckEvent, snapshot: &buck2_data::Snapshot) {
 +        let Some(timestamp_us) = timestamp_micros(event.timestamp.as_ref()) else {
@@ -129,7 +130,7 @@ index 71334ae..df74149 100644
          event: &buck2_data::BuckEvent,
 @@ -2899,7 +2974,7 @@ impl CommandProfileBuilder {
      }
- 
+
      fn invocation_profile_gzip(&self, record: &buck2_data::InvocationRecord) -> Option<Vec<u8>> {
 -        if self.completed_spans.is_empty() {
 +        if self.completed_spans.is_empty() && self.snapshots.is_empty() {
@@ -152,7 +153,7 @@ index 71334ae..df74149 100644
 @@ -3021,6 +3102,23 @@ impl CommandProfileBuilder {
              }));
          }
- 
+
 +        if self.dropped_snapshots > 0 {
 +            trace_events.push(serde_json::json!({
 +                "name": "profile resource snapshots dropped",
@@ -202,12 +203,12 @@ index 71334ae..df74149 100644
 +            Some("//... images")
 +        );
      }
- 
+
      #[test]
 @@ -12001,6 +12102,35 @@ mod tests {
          );
          converter.convert(5, &action_end);
- 
+
 +        // Receive snapshots out of order: the trace still exports chronological samples.
 +        for (index, (micros, user_cpu, system_cpu, rss)) in [
 +            (40_000, 25_000, 35_000, None),
@@ -420,5 +421,48 @@ index 71334ae..df74149 100644
 +        profile.record_snapshot(&missing_timestamp, &buck2_data::Snapshot::default());
 +        assert_eq!(profile.dropped_snapshots, 1);
      }
- 
+
      #[test]
+diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
+index 3d990ac..2bc0db5 100644
+--- a/app/buck2_events/src/sink/scribe.rs
++++ b/app/buck2_events/src/sink/scribe.rs
+@@ -398,6 +398,9 @@ fn should_send_event_data(
+                 Some(Data::ActionError(..)) => true,
+                 #[cfg(not(fbcode_build))]
+                 Some(Data::DiceStateSnapshot(..)) if preserve_bazel_logs => true,
++                // The Bazel command profile derives daemon CPU/RSS counters from snapshots.
++                #[cfg(not(fbcode_build))]
++                Some(Data::Snapshot(..)) if preserve_bazel_logs => true,
+                 Some(Data::RageResult(..)) => true,
+                 Some(Data::ReSession(..)) => true,
+                 Some(Data::StructuredError(..)) => true,
+@@ -919,6 +922,28 @@ mod tests {
+         assert!(!should_send_event_data(&data, &schedule_type, false, false));
+     }
+
++    #[cfg(not(fbcode_build))]
++    #[test]
++    fn bazel_profile_keeps_resource_snapshots() {
++        let schedule_type = SandcastleScheduleType::testing_empty();
++        let snapshot = buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
++            data: Some(buck2_data::instant_event::Data::Snapshot(Box::default())),
++        });
++
++        assert!(should_send_event_data(
++            &snapshot,
++            &schedule_type,
++            false,
++            true
++        ));
++        assert!(!should_send_event_data(
++            &snapshot,
++            &schedule_type,
++            false,
++            false
++        ));
++    }
++
+     #[cfg(not(fbcode_build))]
+     #[test]
+     fn bazel_progress_keeps_progress_source_events() {
