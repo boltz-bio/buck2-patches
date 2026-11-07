@@ -1,0 +1,150 @@
+From 2da4fd34a93c3bcb4906c27c7e5b0d0aab150278 Mon Sep 17 00:00:00 2001
+From: Build tooling contributors <build-tools@example.com>
+Date: Sat, 7 Nov 2026 12:25:15 +0000
+Subject: [PATCH] fix: report failed BXL materializations in build outcomes
+
+BXL returns successful RPC responses containing failed action errors. Its
+completion event discards those errors, so build event consumers report
+success even when the command-line client exits with a failure.
+
+Record the response error outcome in the existing build result field, as
+build and test commands already do. Cover the response boundary and record
+successful and failed anonymous actions against a local event service.
+---
+ app/buck2_bxl/src/command.rs      | 33 +++++++++++++++++++++++
+ examples/bes/bxl_outcome.bxl      | 19 +++++++++++++
+ examples/bes/check_bxl_outcome.py | 45 +++++++++++++++++++++++++++++++
+ 3 files changed, 97 insertions(+)
+ create mode 100644 examples/bes/bxl_outcome.bxl
+ create mode 100644 examples/bes/check_bxl_outcome.py
+
+diff --git a/app/buck2_bxl/src/command.rs b/app/buck2_bxl/src/command.rs
+index 4b18a97..0d8a4a3 100644
+--- a/app/buck2_bxl/src/command.rs
++++ b/app/buck2_bxl/src/command.rs
+@@ -92,6 +92,12 @@ impl ServerCommandTemplate for BxlServerCommand {
+     type Response = buck2_cli_proto::BxlResponse;
+     type PartialResult = buck2_cli_proto::StdoutBytes;
+ 
++    fn build_result(&self, response: &Self::Response) -> Option<buck2_data::BuildResult> {
++        Some(buck2_data::BuildResult {
++            build_completed: response.errors.is_empty(),
++        })
++    }
++
+     fn start_event(&self) -> Self::StartEvent {
+         let bxl_label = self.req.bxl_label.clone();
+         buck2_data::BxlCommandStart { bxl_label }
+@@ -628,6 +634,33 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn command_end_reports_bxl_materialization_failures() {
++        let command = BxlServerCommand {
++            req: BxlRequest::default(),
++        };
++        for error_count in [0, 1, 3] {
++            let result = Ok(BxlResponse {
++                errors: vec![buck2_data::ErrorReport::default(); error_count],
++                ..BxlResponse::default()
++            });
++            let end = buck2_server_ctx::commands::command_end_ext(
++                &result,
++                command.end_event(&result),
++                |response| command.build_result(response),
++            );
++            assert!(
++                end.is_success,
++                "The RPC itself successfully returned its response"
++            );
++            assert_eq!(
++                end.build_result.unwrap().build_completed,
++                error_count == 0,
++                "BXL build outcome must match the errors the client uses for its exit status",
++            );
++        }
++    }
++
+     fn new_test_artifact_group(id: u32) -> ArtifactGroup {
+         let path = format!("a{id}");
+         let target =
+diff --git a/examples/bes/bxl_outcome.bxl b/examples/bes/bxl_outcome.bxl
+new file mode 100644
+index 0000000..e7c226b
+--- /dev/null
++++ b/examples/bes/bxl_outcome.bxl
+@@ -0,0 +1,19 @@
++# Ensure successful and failed anonymous actions to verify BXL command outcomes.
++
++def _run(ctx, command):
++    actions = ctx.bxl_actions().actions
++    output = actions.declare_output("result.txt", has_content_based_path = False)
++    actions.run(
++        cmd_args(["/bin/sh", "-c", command, "--", output.as_output()]),
++        category = "bxl_outcome",
++    )
++    ctx.output.print(ctx.output.ensure(output))
++
++def _pass(ctx):
++    _run(ctx, 'printf "passed\\n" > "$1"')
++
++def _fail(ctx):
++    _run(ctx, 'printf "intentional anonymous action failure\\n" >&2; exit 7')
++
++passing = bxl.main(impl = _pass, cli_args = {})
++failing = bxl.main(impl = _fail, cli_args = {})
+diff --git a/examples/bes/check_bxl_outcome.py b/examples/bes/check_bxl_outcome.py
+new file mode 100644
+index 0000000..1481b7d
+--- /dev/null
++++ b/examples/bes/check_bxl_outcome.py
+@@ -0,0 +1,45 @@
++# Verify BXL's reported build outcome matches the exit status of ensured anonymous actions.
++
++import argparse
++import os
++from pathlib import Path
++import shutil
++import tempfile
++
++import check as recording
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--buck2", required=True)
++    args = parser.parse_args()
++    work = Path(tempfile.mkdtemp(prefix="buck2-bxl-outcome-"))
++    fixture = work / "fixture"
++    shutil.copytree(recording.HERE, fixture, ignore=shutil.ignore_patterns("buck-out", ".buckconfig.local", "__pycache__"))
++    with (fixture / ".buckconfig").open("a") as config:
++        config.write("\n[build]\nexecution_platforms = prelude//platforms:default\n")
++    (work / "stubs").mkdir()
++    recording.generate_stubs(work / "stubs")
++    recording.HERE = fixture
++    check = recording.Check(os.path.abspath(args.buck2), work)
++    server = recording.Server(work, "outcomes")
++    check.configure(server)
++    outcomes = []
++    try:
++        for entry, expected_success in [("passing", True), ("failing", False)]:
++            code, build_id = check.run("bxl", f"//:bxl_outcome.bxl:{entry}")
++            check.expect(code == (0 if expected_success else 3), f"{entry} BXL has the expected native exit status")
++            outcomes.append((build_id, expected_success))
++        check.kill("--bes-drain-timeout=60s")
++    finally:
++        server.stop()
++    for build_id, expected_success in outcomes:
++        check.expect_complete_stream(server.stream(build_id), expected_success)
++    print(f"Recordings: {work}")
++    if check.failures:
++        raise SystemExit(f"{len(check.failures)} BXL outcome checks failed")
++    print("All BXL outcome checks passed")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.53.0
+

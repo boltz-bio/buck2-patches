@@ -1,0 +1,598 @@
+From 9388a10372d2ddfaefd9fa1814405692c75eeea6 Mon Sep 17 00:00:00 2001
+From: Build tooling contributors <build-tools@example.com>
+Date: Sat, 7 Nov 2026 12:25:15 +0000
+Subject: [PATCH] feat: export durable native test outputs
+
+The built-in runner exposes no output declarations to command-line users,
+and remote materializations expire when the test session ends. CI cannot
+retain captures after a single native test invocation.
+
+Add opt-in output declarations through the public test API and copy returned
+local outputs while their lease is live. Export actual statuses and durable
+paths in a versioned NUL manifest, keeping existing invocations unchanged.
+---
+ app/buck2_test_runner/README.md      |  33 +++
+ app/buck2_test_runner/src/config.rs  |  35 +++
+ app/buck2_test_runner/src/lib.rs     |   1 +
+ app/buck2_test_runner/src/outputs.rs | 345 +++++++++++++++++++++++++++
+ app/buck2_test_runner/src/runner.rs  |  44 +++-
+ 5 files changed, 449 insertions(+), 9 deletions(-)
+ create mode 100644 app/buck2_test_runner/README.md
+ create mode 100644 app/buck2_test_runner/src/outputs.rs
+
+diff --git a/app/buck2_test_runner/README.md b/app/buck2_test_runner/README.md
+new file mode 100644
+index 0000000..b5a9200
+--- /dev/null
++++ b/app/buck2_test_runner/README.md
+@@ -0,0 +1,33 @@
++# Built-in test outputs
++
++The built-in runner can declare output directories through the public test
++orchestrator API and export their materialized locations after native tests.
++Existing commands retain their behavior when these options are absent.
++
++```sh
++buck2 test //example:test -- --output-env CAPTURES=images --outputs-manifest /tmp/outputs.bin
++```
++
++Each `--output-env ENV=relative-directory` sets that test environment variable
++to a declared output directory. The directory is pre-created and the runner
++requests local materialization, including after remote execution and cache
++hits. Names must be valid environment identifiers. Directory paths must be
++relative, nonempty, and contain no traversal or platform-specific separators.
++Repeated environment names or directory names are errors.
++
++`--outputs-manifest PATH` writes UTF-8 records framed with NUL bytes. The first
++field is `buck2-test-outputs-v1`. Every remaining record has four fields:
++the exact reported test target, actual test status, declared output name,
++and absolute retained local path. Records sort by target and output name.
++A test with no outputs has empty output name and path fields. A cancelled
++execution records `OMITTED`; execution results retain their `PASS`, `FAIL`,
++or `TIMEOUT` status. Unexpected remote-only output references are errors.
++No field can contain NUL. Tabs, newlines, and Unicode remain literal data.
++
++The runner copies public `ExecutionResult2.outputs` while their materialization
++lease is live into a fresh sibling directory `PATH.d`. That directory must not
++already exist; the runner never removes or overwrites a previous output tree.
++Only regular files and directories are accepted; symlinks and special files
++are errors. Consumers may stage the retained paths after the native command
++without inspecting internal output layouts or caches. Failure artifacts remain outputs
++of that test execution; retaining them does not make a failing test pass.
+diff --git a/app/buck2_test_runner/src/config.rs b/app/buck2_test_runner/src/config.rs
+index f21bc2c..0da7e9a 100644
+--- a/app/buck2_test_runner/src/config.rs
++++ b/app/buck2_test_runner/src/config.rs
+@@ -8,6 +8,7 @@
+  * above-listed licenses.
+  */
+ 
++use std::path::PathBuf;
+ use std::str::FromStr;
+ 
+ use clap::Parser;
+@@ -18,6 +19,14 @@ pub struct Config {
+     #[clap(long)]
+     pub env: Vec<String>,
+ 
++    /// Declare and materialize a test output directory as ENV=relative-directory.
++    #[clap(long)]
++    pub output_env: Vec<String>,
++
++    /// Export actual test statuses and materialized output paths as a versioned NUL-delimited manifest.
++    #[clap(long)]
++    pub outputs_manifest: Option<PathBuf>,
++
+     /// Max number of seconds allowed to run a test.
+     #[clap(long, default_value = "600")]
+     pub timeout: u64,
+@@ -65,3 +74,29 @@ pub enum EnvValueParseError {
+     #[error("Incorrect syntax for env value. Please use name=value. Input: `{0}`")]
+     IncorrectSyntax(String),
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn output_options_are_opt_in_and_leave_existing_defaults_unchanged() {
++        let config = Config::try_parse_from(["runner", "--buck-test-info", "unused"]).unwrap();
++        assert!(config.output_env.is_empty());
++        assert!(config.outputs_manifest.is_none());
++        assert!(config.env.is_empty());
++        assert_eq!(config.timeout, 600);
++        let config = Config::try_parse_from([
++            "runner",
++            "--buck-test-info",
++            "unused",
++            "--output-env",
++            "CAPTURES=images",
++            "--outputs-manifest",
++            "outputs.bin",
++        ])
++        .unwrap();
++        assert_eq!(config.output_env, ["CAPTURES=images"]);
++        assert_eq!(config.outputs_manifest, Some(PathBuf::from("outputs.bin")));
++    }
++}
+diff --git a/app/buck2_test_runner/src/lib.rs b/app/buck2_test_runner/src/lib.rs
+index 53b8a9e..fb5f4af 100644
+--- a/app/buck2_test_runner/src/lib.rs
++++ b/app/buck2_test_runner/src/lib.rs
+@@ -10,6 +10,7 @@
+ 
+ mod config;
+ mod executor;
++mod outputs;
+ mod runner;
+ mod service;
+ pub mod tcp;
+diff --git a/app/buck2_test_runner/src/outputs.rs b/app/buck2_test_runner/src/outputs.rs
+new file mode 100644
+index 0000000..4099edc
+--- /dev/null
++++ b/app/buck2_test_runner/src/outputs.rs
+@@ -0,0 +1,345 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is dual-licensed under either the MIT license found in the
++ * LICENSE-MIT file in the root directory of this source tree or the Apache
++ * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
++ * of this source tree. You may select, at your option, one of the
++ * above-listed licenses.
++ */
++
++//! Declare test output directories and export materialized results through a versioned NUL-delimited manifest.
++
++use std::collections::BTreeSet;
++use std::fs::File;
++use std::io::BufWriter;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::atomic::AtomicU64;
++use std::sync::atomic::Ordering;
++
++use buck2_error::BuckErrorContext;
++use buck2_error::ErrorTag;
++use buck2_error::buck2_error;
++use buck2_test_api::data::ArgValue;
++use buck2_test_api::data::ArgValueContent;
++use buck2_test_api::data::DeclaredOutput;
++use buck2_test_api::data::ExecutionResult2;
++use buck2_test_api::data::Output;
++use buck2_test_api::data::OutputName;
++use buck2_test_api::data::RemoteStorageConfig;
++use buck2_test_api::data::TestStatus;
++use parking_lot::Mutex;
++
++const HEADER: &[u8] = b"buck2-test-outputs-v1\0";
++
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct OutputEnv {
++    name: String,
++    directory: String,
++}
++
++impl OutputEnv {
++    pub(crate) fn parse_all(values: &[String]) -> buck2_error::Result<Vec<Self>> {
++        let mut names = BTreeSet::new();
++        let mut directories = BTreeSet::new();
++        values.iter().map(|value| {
++            let (name, directory) = value.split_once('=').ok_or_else(|| buck2_error!(ErrorTag::Input, "Output environment requires ENV=relative-directory"))?;
++            let mut characters = name.bytes();
++            if !characters.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
++                || !characters.all(|c| c.is_ascii_alphanumeric() || c == b'_')
++                || directory.contains(['\\', '\0', ':'])
++                || directory.split('/').any(|part| part.is_empty() || part == "." || part == "..")
++            {
++                return Err(buck2_error!(ErrorTag::Input, "Output environment needs a valid environment name and a nonempty relative directory without traversal"));
++            }
++            if !names.insert(name.to_owned()) || !directories.insert(directory.to_owned()) {
++                return Err(buck2_error!(ErrorTag::Input, "Output environment names and directories must be distinct"));
++            }
++            Ok(Self { name: name.to_owned(), directory: directory.to_owned() })
++        }).collect()
++    }
++
++    pub(crate) fn environment(&self) -> (String, ArgValue) {
++        (
++            self.name.clone(),
++            ArgValue {
++                content: ArgValueContent::DeclaredOutput(OutputName::unchecked_new(
++                    self.directory.clone(),
++                )),
++                format: None,
++            },
++        )
++    }
++
++    pub(crate) fn declaration(&self) -> DeclaredOutput {
++        DeclaredOutput::unchecked_new(self.directory.clone(), RemoteStorageConfig::new(false))
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct OutputsManifest {
++    records: Mutex<Vec<[String; 4]>>,
++    root: Option<PathBuf>,
++    next_output: AtomicU64,
++}
++
++impl OutputsManifest {
++    pub(crate) fn new(manifest: Option<&Path>) -> buck2_error::Result<Self> {
++        let root = manifest
++            .map(|path| {
++                let mut directory = std::path::absolute(path)?.into_os_string();
++                directory.push(".d");
++                let directory = PathBuf::from(directory);
++                std::fs::create_dir(&directory)
++                    .buck_error_context("Test output destination must be a fresh directory")?;
++                buck2_error::Ok(directory)
++            })
++            .transpose()?;
++        Ok(Self {
++            root,
++            ..Self::default()
++        })
++    }
++
++    pub(crate) fn record_result(
++        &self,
++        target: &str,
++        status: &TestStatus,
++        result: &ExecutionResult2,
++    ) -> buck2_error::Result<()> {
++        let outputs = result
++            .outputs
++            .iter()
++            .map(|(name, output)| {
++                let Output::LocalPath(path) = output else {
++                    return Err(buck2_error!(
++                        ErrorTag::Input,
++                        "Declared test output was not materialized by the orchestrator"
++                    ));
++                };
++                let root = self.root.as_ref().ok_or_else(|| {
++                    buck2_error!(
++                        ErrorTag::Input,
++                        "Output retention requires a manifest destination"
++                    )
++                })?;
++                let destination =
++                    root.join(self.next_output.fetch_add(1, Ordering::Relaxed).to_string());
++                copy_output(Path::new(path.as_os_str()), &destination)?;
++                let destination = destination.to_str().ok_or_else(|| {
++                    buck2_error!(ErrorTag::Input, "Output manifest paths must be valid UTF-8")
++                })?;
++                Ok((name.as_str().to_owned(), destination.to_owned()))
++            })
++            .collect::<buck2_error::Result<Vec<_>>>()?;
++        self.record(target, status, outputs)
++    }
++
++    pub(crate) fn record_cancelled(&self, target: &str) -> buck2_error::Result<()> {
++        self.record(target, &TestStatus::OMITTED, Vec::new())
++    }
++
++    fn record(
++        &self,
++        target: &str,
++        status: &TestStatus,
++        mut outputs: Vec<(String, String)>,
++    ) -> buck2_error::Result<()> {
++        if outputs.is_empty() {
++            outputs.push((String::new(), String::new()));
++        }
++        let status = format!("{status:?}");
++        let records = outputs
++            .into_iter()
++            .map(|(name, path)| [target.to_owned(), status.clone(), name, path])
++            .collect::<Vec<_>>();
++        if records.iter().flatten().any(|value| value.contains('\0')) {
++            return Err(buck2_error!(
++                ErrorTag::Input,
++                "Test output manifest fields cannot contain NUL"
++            ));
++        }
++        self.records.lock().extend(records);
++        Ok(())
++    }
++
++    fn write_to(&self, writer: &mut impl Write) -> buck2_error::Result<()> {
++        let mut records = self.records.lock().clone();
++        records.sort_by(|left, right| {
++            left[0]
++                .cmp(&right[0])
++                .then(left[2].cmp(&right[2]))
++                .then(left[1].cmp(&right[1]))
++                .then(left[3].cmp(&right[3]))
++        });
++        writer.write_all(HEADER)?;
++        for record in records {
++            for field in record {
++                writer.write_all(field.as_bytes())?;
++                writer.write_all(b"\0")?;
++            }
++        }
++        writer.flush()?;
++        Ok(())
++    }
++
++    pub(crate) fn write(&self, path: &Path) -> buck2_error::Result<()> {
++        let file =
++            File::create(path).buck_error_context("Could not create test outputs manifest")?;
++        self.write_to(&mut BufWriter::new(file))
++    }
++}
++
++// Test output leases end with the runner session, so retain only the paths the
++// public execution response returned before reporting the test as finished.
++fn copy_output(source: &Path, destination: &Path) -> buck2_error::Result<()> {
++    let metadata = std::fs::symlink_metadata(source)?;
++    if metadata.is_dir() {
++        std::fs::create_dir(destination)?;
++        for entry in std::fs::read_dir(source)? {
++            let entry = entry?;
++            copy_output(&entry.path(), &destination.join(entry.file_name()))?;
++        }
++    } else if metadata.is_file() {
++        std::fs::copy(source, destination)?;
++    } else {
++        return Err(buck2_error!(
++            ErrorTag::Input,
++            "Declared test outputs must contain only regular files and directories"
++        ));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn temporary_directory() -> PathBuf {
++        let timestamp = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap()
++            .as_nanos();
++        let path = std::env::temp_dir().join(format!(
++            "buck2-output-test-{}-{timestamp}",
++            std::process::id()
++        ));
++        std::fs::create_dir(&path).unwrap();
++        path
++    }
++
++    #[test]
++    fn retained_files_survive_the_original_materialization_lifetime() {
++        let temporary = temporary_directory();
++        let source = temporary.join("ephemeral");
++        std::fs::create_dir_all(source.join("argos")).unwrap();
++        std::fs::write(source.join("argos/image.png"), b"retained screenshot").unwrap();
++        let manifest = OutputsManifest::new(Some(&temporary.join("manifest"))).unwrap();
++        let retained = manifest.root.as_ref().unwrap().join("0");
++        copy_output(&source, &retained).unwrap();
++        std::fs::remove_dir_all(source).unwrap();
++        assert_eq!(
++            std::fs::read(retained.join("argos/image.png")).unwrap(),
++            b"retained screenshot"
++        );
++        assert!(OutputsManifest::new(Some(&temporary.join("manifest"))).is_err());
++        std::fs::remove_dir_all(temporary).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn retention_rejects_symlinks_and_preserves_existing_destinations() {
++        let temporary = temporary_directory();
++        let sibling = temporary.join("sibling");
++        std::fs::write(&sibling, b"private sibling").unwrap();
++        let source = temporary.join("symlink");
++        std::os::unix::fs::symlink(&sibling, &source).unwrap();
++        assert!(copy_output(&source, &temporary.join("retained")).is_err());
++        std::os::unix::fs::symlink(&sibling, temporary.join("manifest.d")).unwrap();
++        assert!(OutputsManifest::new(Some(&temporary.join("manifest"))).is_err());
++        assert_eq!(std::fs::read(sibling).unwrap(), b"private sibling");
++        assert!(!temporary.join("retained").exists());
++        std::fs::remove_dir_all(temporary).unwrap();
++    }
++
++    #[test]
++    fn outputs_use_materialized_declared_directories() {
++        let values = OutputEnv::parse_all(&["CAPTURES=artifacts/images".to_owned()]).unwrap();
++        assert_eq!(values[0].declaration().name.as_str(), "artifacts/images");
++        assert!(
++            !values[0]
++                .declaration()
++                .remote_storage_config
++                .supports_remote
++        );
++        let (name, value) = values[0].environment();
++        assert_eq!(name, "CAPTURES");
++        assert!(
++            matches!(value.content, ArgValueContent::DeclaredOutput(ref output) if output.as_str() == "artifacts/images")
++        );
++    }
++
++    #[test]
++    fn invalid_or_duplicate_output_declarations_are_rejected() {
++        for value in [
++            "MISSING",
++            "=x",
++            "9ENV=x",
++            "ENV=",
++            "ENV=/absolute",
++            "ENV=C:/absolute",
++            "ENV=../sibling",
++            "ENV=a/../b",
++            "ENV=a/./b",
++            "ENV=a//b",
++            "ENV=a\\b",
++            "ENV=a\0b",
++        ] {
++            assert!(
++                OutputEnv::parse_all(&[value.to_owned()]).is_err(),
++                "{value:?}"
++            );
++        }
++        assert!(OutputEnv::parse_all(&["ENV=a".to_owned(), "ENV=b".to_owned()]).is_err());
++        assert!(OutputEnv::parse_all(&["FIRST=a".to_owned(), "SECOND=a".to_owned()]).is_err());
++    }
++
++    #[test]
++    fn manifests_preserve_status_unicode_and_delimiters_in_paths() {
++        let manifest = OutputsManifest::default();
++        manifest
++            .record(
++                "root//pkg:second",
++                &TestStatus::FAIL,
++                vec![("images".to_owned(), "/tmp/a\tb\n雪".to_owned())],
++            )
++            .unwrap();
++        manifest
++            .record("root//pkg:first", &TestStatus::PASS, Vec::new())
++            .unwrap();
++        manifest.record_cancelled("root//pkg:third").unwrap();
++        let mut bytes = Vec::new();
++        manifest.write_to(&mut bytes).unwrap();
++        assert_eq!(
++            String::from_utf8(bytes).unwrap(),
++            "buck2-test-outputs-v1\0root//pkg:first\0PASS\0\0\0root//pkg:second\0FAIL\0images\0/tmp/a\tb\n雪\0root//pkg:third\0OMITTED\0\0\0"
++        );
++    }
++
++    #[test]
++    fn malformed_fields_fail_without_partial_results() {
++        let manifest = OutputsManifest::default();
++        assert!(
++            manifest
++                .record(
++                    "root//pkg:name",
++                    &TestStatus::PASS,
++                    vec![("bad\0name".to_owned(), "/tmp/output".to_owned())]
++                )
++                .is_err()
++        );
++        assert!(manifest.records.lock().is_empty());
++    }
++}
+diff --git a/app/buck2_test_runner/src/runner.rs b/app/buck2_test_runner/src/runner.rs
+index 7898b9f..bbd6e93 100644
+--- a/app/buck2_test_runner/src/runner.rs
++++ b/app/buck2_test_runner/src/runner.rs
+@@ -34,6 +34,8 @@ use parking_lot::Mutex;
+ 
+ use crate::config::Config;
+ use crate::config::EnvValue;
++use crate::outputs::OutputEnv;
++use crate::outputs::OutputsManifest;
+ 
+ pub type SpecReceiver = UnboundedReceiver<ExternalRunnerSpec>;
+ 
+@@ -48,6 +50,8 @@ pub struct Buck2TestRunner {
+     orchestrator_client: TestOrchestratorClient,
+     spec_receiver: Mutex<Option<SpecReceiver>>,
+     config: Config,
++    output_env: Vec<OutputEnv>,
++    outputs: OutputsManifest,
+ }
+ 
+ impl Buck2TestRunner {
+@@ -58,10 +62,14 @@ impl Buck2TestRunner {
+     ) -> buck2_error::Result<Self> {
+         let config = Config::try_parse_from(args)
+             .buck_error_context("Error parsing test runner arguments")?;
++        let output_env = OutputEnv::parse_all(&config.output_env)?;
++        let outputs = OutputsManifest::new(config.outputs_manifest.as_deref())?;
+         Ok(Self {
+             orchestrator_client,
+             spec_receiver: Mutex::new(Some(spec_receiver)),
+             config,
++            output_env,
++            outputs,
+         })
+     }
+ 
+@@ -89,9 +97,19 @@ impl Buck2TestRunner {
+ 
+                 let execution_result = match execution_response {
+                     ExecuteResponse::Result(r) => r,
+-                    ExecuteResponse::Cancelled(_) => return Ok(TestStatus::OMITTED),
++                    ExecuteResponse::Cancelled(_) => {
++                        if self.config.outputs_manifest.is_some() {
++                            self.outputs.record_cancelled(&name)?;
++                        }
++                        return Ok(TestStatus::OMITTED);
++                    }
+                 };
+ 
++                if self.config.outputs_manifest.is_some() {
++                    let status = status_from_execution(&execution_result.status);
++                    self.outputs
++                        .record_result(&name, &status, &execution_result)?;
++                }
+                 let test_result = get_test_result(name, target_handle, execution_result);
+                 let test_status = test_result.status.clone();
+ 
+@@ -116,6 +134,9 @@ impl Buck2TestRunner {
+             )
+             .await;
+ 
++        if let Some(path) = &self.config.outputs_manifest {
++            self.outputs.write(path)?;
++        }
+         self.orchestrator_client
+             .end_of_test_results(run_verdict?.exit_code())
+             .await
+@@ -180,11 +201,12 @@ impl Buck2TestRunner {
+                 )
+             })
+             .chain(config_env)
++            .chain(self.output_env.iter().map(OutputEnv::environment))
+             .collect();
+ 
+         let target_handle = spec.target.handle;
+         let host_sharing_requirements = HostSharingRequirements::default();
+-        let pre_create_dirs = Vec::new();
++        let pre_create_dirs = self.output_env.iter().map(OutputEnv::declaration).collect();
+         let executor_override = None;
+ 
+         self.orchestrator_client
+@@ -215,13 +237,7 @@ fn get_test_result(
+     target: ConfiguredTargetHandle,
+     execution_result: ExecutionResult2,
+ ) -> TestResult {
+-    let status = match execution_result.status {
+-        ExecutionStatus::Finished { exitcode } => match exitcode {
+-            0 => TestStatus::PASS,
+-            _ => TestStatus::FAIL,
+-        },
+-        ExecutionStatus::TimedOut { .. } => TestStatus::TIMEOUT,
+-    };
++    let status = status_from_execution(&execution_result.status);
+     TestResult {
+         target,
+         name,
+@@ -236,6 +252,16 @@ fn get_test_result(
+     }
+ }
+ 
++fn status_from_execution(status: &ExecutionStatus) -> TestStatus {
++    match status {
++        ExecutionStatus::Finished { exitcode } => match *exitcode {
++            0 => TestStatus::PASS,
++            _ => TestStatus::FAIL,
++        },
++        ExecutionStatus::TimedOut { .. } => TestStatus::TIMEOUT,
++    }
++}
++
+ #[derive(Debug)]
+ enum RunVerdict {
+     Pass,
+-- 
+2.53.0
+
