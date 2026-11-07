@@ -23,6 +23,11 @@ Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, 
 | `0009-bes-daemon-resource-counters.patch` | Ours, not yet sent upstream | Adds bounded daemon CPU and RSS samples to the Chrome profile: CPU in cores, RSS in MiB, with timestamps relative to command start. These counters exclude local-action subprocesses and remote executors. |
 | `0010-artifact-source-provenance.patch` | Ours, not yet sent upstream | Exposes a source artifact's complete cell-relative path and canonical origin cell through documented `source_path` and `source_cell` attributes. Source projections and cross-cell exports retain their original provenance; build artifacts return `None`. |
 | `0011-bes-terminal-queue-order.patch` | Ours, not yet sent upstream | Retains command termination when the bounded telemetry queue is full. The worker consumes the already accepted FIFO prefix before the terminal event, while ordinary telemetry stays bounded and command starts keep their protected delivery path. |
+| `0012-report-completed-targets-at-finalization.patch` | Ours, not yet sent upstream | Reports completed dependency targets when the invocation is finalized. |
+| `0013-export-materialized-native-test-outputs.patch` | Ours, not yet sent upstream | Exports native test statuses and durable declared-output copies through the built-in runner's versioned manifest. |
+| `0014-report-failed-bxl-materializations.patch` | Ours, not yet sent upstream | Reports failed BXL materializations as failed build outcomes. |
+| `0015-check-terminal-order-per-invocation-stream.patch` | Ours, not yet sent upstream | Checks concurrent terminal ordering within each invocation's own stream. |
+| `0016-retain-test-outcomes-through-pressure.patch` | Ours, not yet sent upstream | Retains test lifecycle, context and invocation finality when the bounded ingress queue fills, using private disk storage under the replay quota. Priority sends preserve accepted outcomes, and storage or drain failures report incomplete delivery. |
 
 Patches 0001 to 0005 are `git format-patch` of Mercury's commits, unchanged, from the heads of its stacked pull requests (#1598's head contains #1597's commit, and so on; `bes-upstream/5-bes-ci` holds all five).
 
@@ -32,6 +37,7 @@ Things to know when configuring it:
 
 - The daemon reads `[bes]` from the root cell's `.buckconfig` files when it starts, not from `--config-file` or `-c`, and expands `$VAR` in `header` and `build_metadata` from its own environment then.
 - A `header` whose variable is unset or empty turns BES off for that daemon, so an API key in the environment can switch it on and off.
+- Critical ingress overflow shares `[bes] replay_spill_max_bytes` with replay copies in the daemon's private spill directory. Ordinary action/progress events remain bounded and droppable; a critical storage refusal or an unfinished ingress drain returns an explicit incomplete-delivery error.
 - Without patch 0007, `event_format = bazel` gives every invocation `VISIBILITY=PUBLIC` unless `build_metadata` or the command sets `VISIBILITY`, which makes it public on BuildBuddy. With it, an invocation is private unless something sets `PUBLIC`.
 
 [meta/buck2#1608](https://github.com/meta/buck2/pull/1608) (shim fix-ups) isn't carried: it fixes the bootstrap build with Buck2 itself (`buck2 build //:buck2`) on macOS and Windows, and the release builds here use Cargo, as upstream's do.

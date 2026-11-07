@@ -147,6 +147,7 @@ jobs:
             sink::bes_client::tests::terminal_events_survive_a_full_queue_after_delayed_concurrent_starts --exact
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- \
             sink::bes_client::tests::accepted_progress_order_is_scoped_to_each_stream --exact
+          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bes_client
       - name: Test built-in native output declarations and manifests
         working-directory: buck2
         env:
