@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Build tooling contributors <build-tools@example.com>
 Date: Sat, 7 Nov 2026 18:27:07 +0000
-Subject: [PATCH] fix: retain test outcomes through telemetry queue pressure
+Subject: [PATCH 1/2] fix: retain test outcomes through telemetry queue
+ pressure
 
 A full telemetry ingress queue can discard test lifecycle and finalization events while native tests finish successfully. A drain can also acknowledge a stream before accepted tail events are converted.
 
@@ -1262,3 +1263,36 @@ index be29037..da92c24 100644
  #[cfg(not(fbcode_build))]
  fn is_command_start_event(event: &BuckEvent) -> bool {
      matches!(
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Build tooling contributors <build-tools@example.com>
+Date: Sat, 7 Nov 2026 18:30:46 +0000
+Subject: [PATCH 2/2] refactor: keep sink fixture helpers in test builds
+
+Production ingress now uses shared-quota construction and checks queued input before closing streams. The convenience constructors used only by fixtures remain unused in a production binary.
+
+Compile those fixture helpers only for tests while preserving the production ingress path and the existing unit coverage.
+---
+ app/buck2_events/src/sink/bes_client.rs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
+index 02e196d..31132d4 100644
+--- a/app/buck2_events/src/sink/bes_client.rs
++++ b/app/buck2_events/src/sink/bes_client.rs
+@@ -2044,6 +2044,7 @@ struct WorkerState {
+ }
+ 
+ impl WorkerState {
++    #[cfg(test)]
+     fn new(config: BesConfig, connection: ConnectionConfig, counters: Arc<CounterState>) -> Self {
+         let spill_target = config.replay_spill_dir.clone().map(|dir| SpillTarget {
+             dir,
+@@ -2629,6 +2630,7 @@ impl WorkerState {
+         })
+     }
+ 
++    #[cfg(test)]
+     async fn close_due_streams(&mut self) {
+         self.close_due_streams_after_ingress(true).await;
+     }
