@@ -22,6 +22,7 @@ Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, 
 | `0008-bes-stream-order-and-pattern.patch` | Ours, not yet sent upstream | Every stream starts with its command: an event that reaches the converter before the command's start, such as the remote execution session, waits for it, and the command's BuildMetadata follows Started directly, as Bazel sends it. Before, such a stream began as an "unknown" command, and BuildBuddy reported a commit status for it that stayed pending. A command's own `PATTERN` metadata, when set, also replaces the patterns read from its arguments, such as `@argfile`. |
 | `0009-bes-daemon-resource-counters.patch` | Ours, not yet sent upstream | Adds bounded daemon CPU and RSS samples to the Chrome profile: CPU in cores, RSS in MiB, with timestamps relative to command start. These counters exclude local-action subprocesses and remote executors. |
 | `0010-artifact-source-provenance.patch` | Ours, not yet sent upstream | Exposes a source artifact's complete cell-relative path and canonical origin cell through documented `source_path` and `source_cell` attributes. Source projections and cross-cell exports retain their original provenance; build artifacts return `None`. |
+| `0011-bes-terminal-queue-order.patch` | Ours, not yet sent upstream | Retains command termination when the bounded telemetry queue is full. The worker consumes the already accepted FIFO prefix before the terminal event, while ordinary telemetry stays bounded and command starts keep their protected delivery path. |
 
 Patches 0001 to 0005 are `git format-patch` of Mercury's commits, unchanged, from the heads of its stacked pull requests (#1598's head contains #1597's commit, and so on; `bes-upstream/5-bes-ci` holds all five).
 
@@ -47,7 +48,7 @@ These attributes contain path metadata and create no dependency on source conten
 
 1. `scripts/apply.sh` checks out the pin and applies the patches. A patch that doesn't apply fails the run and names the patch.
 2. It builds `buck2` with upstream's release flags (`cargo build --release`, `-C codegen-units=1`, the toolchain from `rust-toolchain.toml`) on `ubuntu-26.04` and `macos-15`.
-3. It checks each binary on `examples/with_prelude`, as upstream's release workflow does, and validates source provenance, public API docs, and path-only caching on both platforms. On Linux it also runs `examples/bes/check.py` and checks that the bundled prelude matches the tree's.
+3. It checks each binary on `examples/with_prelude`, as upstream's release workflow does, and validates source provenance, public API docs, path-only caching, and terminal event delivery through a full concurrent queue on both platforms. On Linux it also runs `examples/bes/check.py` and checks that the bundled prelude matches the tree's.
 
 To try the patches locally:
 

@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Demitri Nava <demitri@boltz.bio>
+Date: Sat, 7 Nov 2026 00:08:02 +0000
+Subject: [PATCH] fix: retain terminal BES events under queue pressure
+
+Concurrent commands can fill the bounded telemetry queue and discard a
+command's final event. Its server then retains an unfinished invocation
+even when the command succeeded.
+
+Deliver terminal events through the control lane after the accepted FIFO
+prefix. Preserve bounded ordinary telemetry and protected starts, cover
+queue-consumption races with a recording server, and report the effective
+start deadline.
+---
+ app/buck2_events/src/sink/bes_client.rs | 194 ++++++++++++++++++++++++
+ app/buck2_events/src/sink/scribe.rs     |  35 ++++-
+ 2 files changed, 223 insertions(+), 6 deletions(-)
+
+diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
+index f71cc03..c6eca5f 100644
+--- a/app/buck2_events/src/sink/bes_client.rs
++++ b/app/buck2_events/src/sink/bes_client.rs
+@@ -240,6 +240,10 @@ pub struct Message {
+ enum WorkerRequest {
+     Send(SendNowRequest),
+     Drain(DrainRequest),
++    Terminal {
++        message: Message,
++        queued_before: usize,
++    },
+ }
+ 
+ struct SendNowRequest {
+@@ -1467,6 +1471,23 @@ impl BesClient {
+         }
+     }
+ 
++    /// Retains a command's terminal event even when ordinary telemetry fills the queue.
++    /// The worker first consumes at least the FIFO prefix already accepted when it was sent.
++    pub fn offer_terminal(&self, message: Message) {
++        let queued_before = self.tx.len();
++        if self
++            .send_now_tx
++            .send(WorkerRequest::Terminal {
++                message,
++                queued_before,
++            })
++            .is_err()
++        {
++            self.counters.inc_failures_enqueue_failed();
++            self.counters.inc_dropped();
++        }
++    }
++
+     async fn send_messages_with_priority(
+         &self,
+         messages: Vec<Message>,
+@@ -1627,6 +1648,20 @@ fn process_request(
+ ) {
+     match request {
+         WorkerRequest::Send(request) => process_send_now_request(runtime, worker, request),
++        WorkerRequest::Terminal {
++            message,
++            queued_before,
++        } => {
++            // A priority terminal must not overtake accepted test results or source events.
++            // The captured length bounds this work even while other commands keep enqueueing.
++            for _ in 0..queued_before {
++                let Ok(earlier) = queued.try_recv() else {
++                    break;
++                };
++                process_queued_message(runtime, worker, earlier);
++            }
++            drop(runtime.block_on(worker.send_message_with_retry(&message, false)));
++        }
+         WorkerRequest::Drain(DrainRequest {
+             scope,
+             deadline,
+@@ -3780,6 +3815,7 @@ mod tests {
+     use bes_grpc_proto::google::devtools::build::v1::publish_build_event_server::PublishBuildEvent;
+     use bes_grpc_proto::google::devtools::build::v1::publish_build_event_server::PublishBuildEventServer;
+     use buck2_wrapper_common::invocation_id::TraceId;
++    use dupe::Dupe;
+     use google_grpc_proto::google::bytestream::QueryWriteStatusRequest;
+     use google_grpc_proto::google::bytestream::QueryWriteStatusResponse;
+     use google_grpc_proto::google::bytestream::ReadRequest;
+@@ -6893,6 +6929,164 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn terminal_events_survive_a_full_queue_after_delayed_concurrent_starts() {
++        for consumed_before_terminal in [0, 1, 2] {
++            let runtime = tokio::runtime::Runtime::new().expect("runtime");
++            let (endpoint, streams, events) =
++                runtime.block_on(serve_bes_that_acks_at_eof_keeping_bazel_events(None));
++            let mut worker = bazel_worker_for(endpoint);
++            let counters = worker.counters.dupe();
++            let (tx, queued) = crossbeam_channel::bounded(2);
++            let (send_now_tx, requests) = crossbeam_channel::unbounded();
++            let client = BesClient {
++                tx,
++                send_now_tx,
++                counters: counters.dupe(),
++                grpc_timeout: Duration::from_secs(2),
++            };
++            let ids = [TraceId::new(), TraceId::new()];
++            // The worker is deliberately paused, so protected starts time out without being lost.
++            for id in &ids {
++                let started = Instant::now();
++                assert!(matches!(
++                    client.send_messages_within(
++                        vec![make_message(
++                            Some(&id.to_string()),
++                            Some(1),
++                            command_start_data()
++                        )],
++                        Duration::from_millis(5),
++                    ),
++                    PrioritySend::StillQueued
++                ));
++                assert!((Instant::now() - started) < Duration::from_millis(500));
++            }
++            let sink = Arc::new(crate::sink::scribe::RemoteEventSink::with_test_client(
++                client,
++            ));
++            for (id, marker) in ids
++                .iter()
++                .zip(["first retained result", "second retained result"])
++            {
++                sink.offer(crate::BuckEvent::new(
++                    SystemTime::now(),
++                    id.dupe(),
++                    None,
++                    None,
++                    buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
++                        data: Some(
++                            buck2_data::ConsoleMessage {
++                                message: marker.to_owned(),
++                            }
++                            .into(),
++                        ),
++                    }),
++                ));
++            }
++            assert_eq!(queued.len(), 2);
++            // Ordinary progress remains bounded and droppable when this tiny queue is full.
++            sink.offer(crate::BuckEvent::new(
++                SystemTime::now(),
++                ids[0].dupe(),
++                None,
++                None,
++                action_start_data(),
++            ));
++            assert_eq!(queued.len(), 2);
++            assert_eq!(counters.snapshot().dropped, 1);
++            let started = Instant::now();
++            thread::scope(|scope| {
++                for id in &ids {
++                    let sink = sink.dupe();
++                    scope.spawn(move || {
++                        sink.offer(crate::BuckEvent::new(
++                            SystemTime::now(),
++                            id.dupe(),
++                            None,
++                            None,
++                            command_end_data(),
++                        ))
++                    });
++                }
++            });
++            assert!((Instant::now() - started) < Duration::from_millis(500));
++            // Release the delayed worker through the same dispatcher the production loop uses.
++            for _ in 0..2 {
++                process_request(
++                    &runtime,
++                    &mut worker,
++                    requests.try_recv().expect("protected start"),
++                    &queued,
++                );
++            }
++            // The worker may consume part or all of the captured prefix before it notices
++            // a terminal request. Its bounded extra drain preserves ordering either way.
++            for _ in 0..consumed_before_terminal {
++                let message = queued.try_recv().expect("captured prefix");
++                process_queued_message(&runtime, &mut worker, message);
++            }
++            while let Ok(request) = requests.try_recv() {
++                process_request(&runtime, &mut worker, request, &queued);
++            }
++            while let Ok(message) = queued.try_recv() {
++                process_queued_message(&runtime, &mut worker, message);
++            }
++            let report = runtime.block_on(worker.drain(
++                DrainScope::FinishedCommands,
++                Instant::now() + Duration::from_secs(5),
++                std::future::pending(),
++            ));
++            assert!(
++                report.is_complete(),
++                "terminal events must reach EOF and be acknowledged: {report:?}"
++            );
++            assert_eq!(report.streams.len(), 2);
++            let streams = streams.lock().unwrap();
++            assert_eq!(streams.len(), 2);
++            for stream in streams.iter() {
++                assert!(stream.iter().copied().eq(1..=stream.len() as i64));
++            }
++            let events = events.lock().unwrap();
++            let finished = events
++                .iter()
++                .enumerate()
++                .filter_map(|(index, event)| {
++                    matches!(
++                        event.payload,
++                        Some(
++                            bazel_bep_proto::build_event_stream::build_event::Payload::Finished(_)
++                        )
++                    )
++                    .then_some(index)
++                })
++                .collect::<Vec<_>>();
++            assert_eq!(finished.len(), 2);
++            for marker in ["first retained result", "second retained result"] {
++                assert!(
++                    events[..finished[0]].iter().any(|event| {
++                        match event.payload.as_ref() {
++                            Some(
++                                bazel_bep_proto::build_event_stream::build_event::Payload::Progress(
++                                    progress,
++                                ),
++                            ) => {
++                                progress.stdout.contains(marker) || progress.stderr.contains(marker)
++                            }
++                            _ => false,
++                        }
++                    }),
++                    "accepted data must precede terminal events: {marker}"
++                );
++            }
++            assert_eq!(
++                counters.snapshot().dropped,
++                1,
++                "only overflow progress is dropped"
++            );
++        }
++    }
++
+     #[tokio::test]
+     async fn a_drain_closes_a_finished_command_and_waits_for_a_server_that_acks_at_eof() {
+         let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
+index 2bc0db5..be29037 100644
+--- a/app/buck2_events/src/sink/scribe.rs
++++ b/app/buck2_events/src/sink/scribe.rs
+@@ -120,6 +120,17 @@ impl RemoteEventSink {
+         })
+     }
+ 
++    #[cfg(all(test, not(fbcode_build)))]
++    pub(crate) fn with_test_client(client: crate::sink::bes_client::BesClient) -> Self {
++        Self {
++            category: "test".to_owned(),
++            client,
++            upload_successful_action_events: false,
++            preserve_bazel_logs: true,
++            schedule_type: SandcastleScheduleType::testing_empty(),
++        }
++    }
++
+     // Send this event now, bypassing internal message queue.
+     pub async fn send_now(&self, event: BuckEvent) -> buck2_error::Result<()> {
+         self.send_messages_now(vec![event]).await
+@@ -192,11 +203,23 @@ impl RemoteEventSink {
+             message_key: Some(message_key),
+         });
+         #[cfg(not(fbcode_build))]
+-        self.client.offer(crate::sink::bes_client::Message {
+-            category: self.category.clone(),
+-            message: Self::encode_message(event, self.preserve_bazel_logs),
+-            message_key: Some(message_key),
+-        });
++        {
++            let terminal = matches!(
++                event.data(),
++                buck2_data::buck_event::Data::SpanEnd(span)
++                    if matches!(span.data.as_ref(), Some(buck2_data::span_end_event::Data::Command(_)))
++            );
++            let message = crate::sink::bes_client::Message {
++                category: self.category.clone(),
++                message: Self::encode_message(event, self.preserve_bazel_logs),
++                message_key: Some(message_key),
++            };
++            if terminal {
++                self.client.offer_terminal(message);
++            } else {
++                self.client.offer(message);
++            }
++        }
+     }
+ 
+     // Encodes message for transport.
+@@ -471,7 +494,7 @@ impl EventSink for RemoteEventSink {
+                             PrioritySend::Done(Err(_)) => self.offer(event),
+                             PrioritySend::StillQueued => tracing::warn!(
+                                 "BES sink: CommandStart not sent within {:?}; the command goes on, and the event is sent ahead of the command's later events once the sink's worker is free",
+-                                COMMAND_START_SEND_DEADLINE
++                                command_start_send_deadline()
+                             ),
+                         }
+                         return;

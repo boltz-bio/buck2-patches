@@ -137,6 +137,14 @@ jobs:
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::scribe::tests::bazel_profile_keeps_resource_snapshots
           cargo test --release --target ${{ matrix.triple }} -p buck2_build_api_tests --test buck2_build_api_tests interpreter::rule_defs::artifact::
+      # This recording-server lifecycle regression is mandatory on both release hosts.
+      - name: Test terminal BES delivery through a full concurrent queue
+        working-directory: buck2
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
+        run: |
+          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- \
+            sink::bes_client::tests::terminal_events_survive_a_full_queue_after_delayed_concurrent_starts --exact
       - name: Print the version
         run: buck2/target/${{ matrix.triple }}/release/buck2 --version
       # As upstream's release workflow checks each binary it builds.
