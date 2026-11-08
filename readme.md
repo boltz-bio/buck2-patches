@@ -21,7 +21,6 @@ Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, 
 | `0007-bes-private-by-default-and-command-line.patch` | Ours, not yet sent upstream | An invocation no longer gets `VISIBILITY=PUBLIC` when nothing sets it, so it stays private to the BES server's organization, as a Bazel invocation does; a command or `[bes] build_metadata` can still set it. Each command also sends its command line after the binary, as a JSON array, as `EXPLICIT_COMMAND_LINE`, which BuildBuddy shows on a workflow's list of the invocations it ran. |
 | `0008-bes-stream-order-and-pattern.patch` | Ours, not yet sent upstream | Every stream starts with its command: an event that reaches the converter before the command's start, such as the remote execution session, waits for it, and the command's BuildMetadata follows Started directly, as Bazel sends it. Before, such a stream began as an "unknown" command, and BuildBuddy reported a commit status for it that stayed pending. A command's own `PATTERN` metadata, when set, also replaces the patterns read from its arguments, such as `@argfile`. |
 | `0009-bes-daemon-resource-counters.patch` | Ours, not yet sent upstream | Adds bounded daemon CPU and RSS samples to the Chrome profile: CPU in cores, RSS in MiB, with timestamps relative to command start. These counters exclude local-action subprocesses and remote executors. |
-| `0010-artifact-source-provenance.patch` | Ours, not yet sent upstream | Exposes a source artifact's complete cell-relative path and canonical origin cell through documented `source_path` and `source_cell` attributes. Source projections and cross-cell exports retain their original provenance; build artifacts return `None`. |
 | `0011-bes-terminal-queue-order.patch` | Ours, not yet sent upstream | Retains command termination when the bounded telemetry queue is full. The worker consumes the already accepted FIFO prefix before the terminal event, while ordinary telemetry stays bounded and command starts keep their protected delivery path. |
 | `0012-report-completed-targets-at-finalization.patch` | Ours, not yet sent upstream | Reports completed dependency targets when the invocation is finalized. |
 | `0013-export-materialized-native-test-outputs.patch` | Ours, not yet sent upstream | Exports native test statuses and durable declared-output copies through the built-in runner's versioned manifest. |
@@ -42,19 +41,13 @@ Things to know when configuring it:
 
 [meta/buck2#1608](https://github.com/meta/buck2/pull/1608) (shim fix-ups) isn't carried: it fixes the bootstrap build with Buck2 itself (`buck2 build //:buck2`) on macOS and Windows, and the release builds here use Cargo, as upstream's do.
 
-## Source artifact API
-
-`Artifact.source_path` is the complete logical path relative to the source's original cell root, including its package and every projected suffix. `project(..., hide_prefix=True)` changes `short_path` but leaves `source_path` intact. `Artifact.source_cell` is that source's canonical origin cell name, even when an alias or an exporting target in another cell names it. Both attributes return `None` for build artifacts, including unbound declared artifacts.
-
-These attributes contain path metadata and create no dependency on source contents. They do not render physical execution paths: use Buck2's documented `cmd_args(artifact, relative_to=label.project_root)` or `label.cell_root` for those. Their Rust documentation appears in `buck2 docs starlark-builtins`. The release checks source aliases, cross-cell reexports, projections, generated artifacts, source-edit cache reuse, and rename invalidation on Linux and macOS through `scripts/check_source_paths.py`.
-
 ## How it builds
 
 `.github/workflows/build.yaml` runs on every push to `main` and every release tag, and on demand (`workflow_dispatch`). Pull requests don't run it: the repository is public, and nothing from outside it runs here.
 
 1. `scripts/apply.sh` checks out the pin and applies the patches. A patch that doesn't apply fails the run and names the patch.
 2. It builds `buck2` with upstream's release flags (`cargo build --release`, `-C codegen-units=1`, the toolchain from `rust-toolchain.toml`) on `ubuntu-26.04` and `macos-15`.
-3. It checks each binary on `examples/with_prelude`, as upstream's release workflow does, and validates source provenance, public API docs, path-only caching, and terminal event delivery through a full concurrent queue on both platforms. On Linux it also runs `examples/bes/check.py` and checks that the bundled prelude matches the tree's.
+3. It checks each binary on `examples/with_prelude`, as upstream's release workflow does, and validates physical source path rendering, path-only caching, and terminal event delivery through a full concurrent queue on both platforms. On Linux it also runs `examples/bes/check.py` and checks that the bundled prelude matches the tree's.
 
 To try the patches locally:
 

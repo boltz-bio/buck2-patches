@@ -169,7 +169,7 @@ jobs:
         run: |
           "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" build rust/... cpp/... python/... -v=2
           "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" kill
-      - name: Check source provenance and path-only caching
+      - name: Check physical source paths and path-only caching
         run: |
           python3 scripts/check_source_paths.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
       # Mercury's check of what buck2 sends a Build Event Service, against a

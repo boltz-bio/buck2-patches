@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check source provenance, generated-artifact behavior, docs, and path-only caching on a real Buck2 binary."""
+"""Check physical source path rendering and path-only caching on a real Buck2 binary."""
 
 from __future__ import annotations
 
@@ -20,38 +20,16 @@ def _relay(ctx):
 
 relay = rule(impl = _relay, attrs = {"src": attrs.dep()})
 
-def _generated(ctx):
-    unbound = ctx.actions.declare_output("generated.txt")
-    if unbound.source_path != None or unbound.source_cell != None:
-        fail("An unbound build artifact has source provenance")
-    bound = ctx.actions.write(unbound, "generated")
-    return [DefaultInfo(default_output = bound)]
-
-generated = rule(impl = _generated, attrs = {})
-
 def _contract(ctx):
     own = ctx.attrs.own
     foreign = ctx.attrs.foreign
     relayed = ctx.attrs.relay[DefaultInfo].default_outputs[0]
     directory = ctx.attrs.directory
     projected = directory.project("nested").project("file.txt", hide_prefix = True)
-    expected = [
-        (own, "root", "local/root.txt"),
-        (foreign, "other", "origin/" + ctx.attrs.foreign_name),
-        (relayed, "other", "origin/" + ctx.attrs.foreign_name),
-        (projected, "other", "origin/tree/nested/file.txt"),
-    ]
-    for artifact, cell, path in expected:
-        if artifact.source_cell != cell or artifact.source_path != path:
-            fail("Wrong source provenance: expected %s//%s" % (cell, path))
     if projected.short_path != "file.txt":
         fail("Projection did not hide its short-path prefix")
-    output = ctx.attrs.generated[DefaultInfo].default_outputs[0]
-    if output.source_path != None or output.source_cell != None:
-        fail("A generated artifact has source provenance")
     paths = ctx.actions.write_json("paths.json", {
-        "logical": [[a.source_cell, a.source_path] for a, _, _ in expected],
-        "physical": cmd_args([a for a, _, _ in expected], relative_to = ctx.label.project_root, ignore_artifacts = True),
+        "physical": cmd_args([own, foreign, relayed, projected], relative_to = ctx.label.project_root, ignore_artifacts = True),
     })
     result = ctx.actions.declare_output("paths.copy.json")
     ctx.actions.run(
@@ -65,21 +43,16 @@ contract = rule(impl = _contract, attrs = {
     "foreign": attrs.source(),
     "relay": attrs.dep(),
     "directory": attrs.source(allow_directory = True),
-    "generated": attrs.dep(),
-    "foreign_name": attrs.string(),
 })
 """
 
-ROOT_BUILD = """load(":defs.bzl", "contract", "generated")
-generated(name = "generated")
+ROOT_BUILD = """load(":defs.bzl", "contract")
 contract(
     name = "contract",
     own = "//local:root.txt",
     foreign = "foreign_alias//origin:source",
     relay = "//relay:source",
     directory = "foreign_alias//origin:tree",
-    generated = ":generated",
-    foreign_name = "{foreign_name}",
 )
 """
 
@@ -98,7 +71,7 @@ def run(binary: pathlib.Path, project: pathlib.Path, *args: str) -> str:
 
 def build(
     binary: pathlib.Path, project: pathlib.Path
-) -> dict[str, list[str] | list[list[str]]]:
+) -> dict[str, list[str]]:
     outputs = json.loads(
         run(binary, project, "build", "//:contract", "--show-full-json-output")
     )
@@ -145,9 +118,14 @@ def check(binary: pathlib.Path, project: pathlib.Path) -> None:
         'load("//:defs.bzl", "relay")\n'
         'relay(name = "source", src = "foreign_alias//origin:source", visibility = ["PUBLIC"])\n'
     )
-    root_build = project / "BUCK"
-    root_build.write_text(ROOT_BUILD.format(foreign_name="source.txt"))
+    (project / "BUCK").write_text(ROOT_BUILD)
     before = build(binary, project)
+    assert before["physical"] == [
+        "local/root.txt",
+        "foreign/origin/source.txt",
+        "foreign/origin/source.txt",
+        "foreign/origin/tree/nested/file.txt",
+    ]
     assert executions(binary, project), (
         "The downstream path consumer did not execute initially"
     )
@@ -163,30 +141,18 @@ def check(binary: pathlib.Path, project: pathlib.Path) -> None:
     foreign_build.write_text(
         foreign_build.read_text().replace('src = "source.txt"', 'src = "renamed.txt"')
     )
-    root_build.write_text(ROOT_BUILD.format(foreign_name="renamed.txt"))
     after = build(binary, project)
     assert after != before, "A source rename did not change source path metadata"
     assert executions(binary, project), (
         "A source rename did not rerun the path-only consumer"
     )
-    assert after["logical"][1:] == [
-        ["other", "origin/renamed.txt"],
-        ["other", "origin/renamed.txt"],
-        ["other", "origin/tree/nested/file.txt"],
+    assert after["physical"] == [
+        "local/root.txt",
+        "foreign/origin/renamed.txt",
+        "foreign/origin/renamed.txt",
+        "foreign/origin/tree/nested/file.txt",
     ]
-
-    docs = project / "docs"
-    run(binary, project, "docs", "starlark-builtins", "--output-dir", str(docs))
-    artifact_docs = (docs / "build/Artifact.md").read_text()
-    assert "Artifact.source_path:" in artifact_docs, (
-        "The public source_path API is undocumented"
-    )
-    assert "Artifact.source_cell:" in artifact_docs, (
-        "The public source_cell API is undocumented"
-    )
-    print(
-        "PASS: root/foreign/alias/reexport/projection/output provenance, path-only caching, and public API docs"
-    )
+    print("PASS: physical paths for local files, cross-cell reexports and projections, and path-only caching")
 
 
 def main() -> None:
