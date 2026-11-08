@@ -250,7 +250,7 @@ index f71cc03..c6eca5f 100644
      async fn a_drain_closes_a_finished_command_and_waits_for_a_server_that_acks_at_eof() {
          let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
 diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
-index 2bc0db5..be29037 100644
+index 3d990ac..63d7605 100644
 --- a/app/buck2_events/src/sink/scribe.rs
 +++ b/app/buck2_events/src/sink/scribe.rs
 @@ -120,6 +120,17 @@ impl RemoteEventSink {
@@ -300,7 +300,7 @@ index 2bc0db5..be29037 100644
      }
  
      // Encodes message for transport.
-@@ -471,7 +494,7 @@ impl EventSink for RemoteEventSink {
+@@ -468,7 +491,7 @@ impl EventSink for RemoteEventSink {
                              PrioritySend::Done(Err(_)) => self.offer(event),
                              PrioritySend::StillQueued => tracing::warn!(
                                  "BES sink: CommandStart not sent within {:?}; the command goes on, and the event is sent ahead of the command's later events once the sink's worker is free",

@@ -1178,7 +1178,7 @@ index 439efa6..02e196d 100644
                  send_now_tx,
                  counters: counters.dupe(),
 diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
-index be29037..da92c24 100644
+index 63d7605..6022082 100644
 --- a/app/buck2_events/src/sink/scribe.rs
 +++ b/app/buck2_events/src/sink/scribe.rs
 @@ -204,18 +204,14 @@ impl RemoteEventSink {
@@ -1212,7 +1212,7 @@ index be29037..da92c24 100644
                  // Buck2->BuildBuddy target mapping uses analysis start to
                  // synthesize target configured events.
                  #[cfg(not(fbcode_build))]
-@@ -542,6 +540,50 @@ fn message_key(event: &BuckEvent) -> i64 {
+@@ -539,6 +537,50 @@ fn message_key(event: &BuckEvent) -> i64 {
      event.trace_id().unwrap().hash()
  }
  
