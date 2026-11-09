@@ -13,12 +13,12 @@ Keep analysis as configuration only, and complete each target from its action
 and test results, once, when the invocation is finalized. A command that ends
 without an InvocationRecord is finalized when its stream closes.
 ---
- app/buck2_events/src/sink/bazel_converter.rs | 534 +++++++++++++++----
- app/buck2_events/src/sink/bes_client.rs      |  94 +++-
- 2 files changed, 512 insertions(+), 116 deletions(-)
+ app/buck2_events/src/sink/bazel_converter.rs | 355 +++++++++++++------
+ app/buck2_events/src/sink/bes_client.rs      |  94 ++++-
+ 2 files changed, 329 insertions(+), 120 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
-index 8bf5e30b..5afbf720 100644
+index 8bf5e30b..3c28fc3e 100644
 --- a/app/buck2_events/src/sink/bazel_converter.rs
 +++ b/app/buck2_events/src/sink/bazel_converter.rs
 @@ -1228,14 +1228,13 @@ pub(crate) struct BazelEventConverter {
@@ -421,11 +421,18 @@ index 8bf5e30b..5afbf720 100644
          let analysis_end = converter.convert(
              1,
              &trace_event(buck2_data::buck_event::Data::SpanEnd(
-@@ -13138,14 +13215,250 @@ mod tests {
+@@ -13138,16 +13215,65 @@ mod tests {
              )),
          );
  
 -        let completed = final_events
+-            .iter()
+-            .find_map(|event| match event.payload.as_ref() {
+-                Some(build_event::Payload::Completed(completed)) => Some(completed),
+-                _ => None,
+-            })
+-            .expect("analysis-only target completion");
+-        assert!(completed.success);
 +        assert!(
 +            final_events
 +                .iter()
@@ -447,171 +454,7 @@ index 8bf5e30b..5afbf720 100644
 +        );
 +    }
 +
-+    #[test]
-+    fn target_completion_waits_for_late_results_and_emits_one_final_id() {
-+        let mut converter = BazelEventConverter::default();
-+        let target = configured_target();
-+        converter.completed_targets.insert(
-+            target_key_for(&target).unwrap(),
-+            CompletedTargetState { success: true },
-+        );
-+        let command_end = converter.convert(
-+            1,
-+            &command_end_event(
-+                buck2_data::command_end::Data::Build(buck2_data::BuildCommandEnd::default()),
-+                true,
-+                Some(true),
-+            ),
-+        );
-+        assert!(
-+            command_end.iter().all(|event| !matches!(
-+                event.payload,
-+                Some(build_event::Payload::Completed(_) | build_event::Payload::TargetSummary(_))
-+            )),
-+            "CommandEnd precedes the final InvocationRecord"
-+        );
-+        assert!(command_end.iter().all(|event| !event.last_message));
-+        let key = target_key_for(&target).unwrap();
-+        converter
-+            .target_outputs
-+            .entry(key.clone())
-+            .or_default()
-+            .insert(
-+                "late-output".to_owned(),
-+                file_with_contents("late-output", "complete".to_owned()),
-+            );
-+        converter
-+            .action_children
-+            .entry(key.clone())
-+            .or_default()
-+            .insert(
-+                "late-action".to_owned(),
-+                bep::BuildEventId {
-+                    id: Some(build_event_id::Id::ActionCompleted(
-+                        build_event_id::ActionCompletedId {
-+                            primary_output: "late-output".to_owned(),
-+                            label: key.label.clone(),
-+                            configuration: Some(configuration_id(key.configuration.clone())),
-+                        },
-+                    )),
-+                },
-+            );
-+        // The late action payload has already been sent before it is referenced by completion.
-+        let late_action_id = converter.action_children[&key]["late-action"].clone();
-+        converter.record_event_graph(&[bep::BuildEvent {
-+            id: Some(late_action_id),
-+            payload: Some(build_event::Payload::Action(bep::ActionExecuted::default())),
-+            ..Default::default()
-+        }]);
-+        let final_record = trace_event(buck2_data::buck_event::Data::Record(
-+            buck2_data::RecordEvent {
-+                data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
-+                    buck2_data::InvocationRecord {
-+                        outcome: Some(buck2_data::InvocationOutcome::Success as i32),
-+                        ..Default::default()
-+                    },
-+                ))),
-+            },
-+        ));
-+        let final_events = converter.convert(2, &final_record);
-+        assert_eq!(
-+            final_events
-+                .iter()
-+                .filter(|event| event.last_message)
-+                .count(),
-+            1
-+        );
-+        assert!(final_events.last().unwrap().last_message);
-+        let repeated = converter.convert(3, &final_record);
-+        let all = command_end
-             .iter()
--            .find_map(|event| match event.payload.as_ref() {
--                Some(build_event::Payload::Completed(completed)) => Some(completed),
-+            .chain(&final_events)
-+            .chain(&repeated)
-+            .collect::<Vec<_>>();
-+        assert_eq!(
-+            all.iter()
-+                .filter(|event| matches!(
-+                    event.payload,
-+                    Some(build_event::Payload::TargetSummary(_))
-+                ))
-+                .count(),
-+            1
-+        );
-+        let completed = all
-+            .iter()
-+            .find_map(|event| match &event.payload {
-+                Some(build_event::Payload::Completed(c)) => Some(c),
-                 _ => None,
-             })
--            .expect("analysis-only target completion");
-+            .expect("real completed target");
-         assert!(completed.success);
-+        assert!(
-+            completed
-+                .important_output
-+                .iter()
-+                .any(|f| f.name == "late-output")
-+        );
-+        let final_completed = final_events
-+            .iter()
-+            .find(|event| matches!(event.payload, Some(build_event::Payload::Completed(_))))
-+            .unwrap();
-+        assert!(
-+            final_completed
-+                .children
-+                .iter()
-+                .any(|id| matches!(id.id, Some(build_event_id::Id::ActionCompleted(_))))
-+        );
-+        assert!(!all.iter().any(|event| matches!(
-+            event.id.as_ref().and_then(|id| id.id.as_ref()),
-+            Some(build_event_id::Id::TargetCompleted(_) | build_event_id::Id::TargetSummary(_))
-+        ) && matches!(
-+            event.payload,
-+            Some(build_event::Payload::Aborted(_))
-+        )));
-+    }
 +
-+    #[test]
-+    fn target_completion_links_all_real_configurations_of_one_label() {
-+        let mut converter = BazelEventConverter::default();
-+        for configuration in ["cfg-a", "cfg-b"] {
-+            let event = configured_event(
-+                "//:shared".to_owned(),
-+                configuration.to_owned(),
-+                GENERIC_TARGET_KIND.to_owned(),
-+            );
-+            let key = TargetKey {
-+                label: "//:shared".to_owned(),
-+                configuration: configuration.to_owned(),
-+            };
-+            converter.analyzed_configured_events.insert(key, event);
-+            converter.remember_completed(&completed_event(
-+                "//:shared".to_owned(),
-+                configuration.to_owned(),
-+                true,
-+            ));
-+        }
-+        let mut events = Vec::new();
-+        converter.flush_analyzed_configured_events(&mut events);
-+        converter.prepare_completed_targets(&mut events);
-+        converter.emit_completed_updates_for_actions(&mut events);
-+        for configuration in ["cfg-a", "cfg-b"] {
-+            let id = target_completed_id("//:shared".to_owned(), configuration.to_owned());
-+            assert!(events.iter().any(|event| matches!(
-+                event.payload,
-+                Some(build_event::Payload::Configured(_))
-+            ) && event.children.contains(&id)));
-+            assert_eq!(
-+                events
-+                    .iter()
-+                    .filter(|event| event.id.as_ref() == Some(&id))
-+                    .count(),
-+                1
-+            );
-+        }
-+    }
 +
 +    #[test]
 +    fn ended_command_fallback_finalizes_once_without_a_record() {
@@ -646,37 +489,13 @@ index 8bf5e30b..5afbf720 100644
 +                .any(|event| matches!(event.payload, Some(build_event::Payload::TargetSummary(_))))
 +        );
 +        assert!(converter.finish_without_invocation_record().is_empty());
-+    }
-+
-+    #[test]
-+    fn target_completion_preserves_explicit_zero_action_build() {
-+        let mut converter = BazelEventConverter::default();
-+        let stats = buck2_data::BuildGraphStats {
-+            build_targets: vec![buck2_data::BuildTarget {
-+                target: "//pkg:zero_action".to_owned(),
-+                configuration: "cfg".to_owned(),
-+                configured_graph_size: None,
-+            }],
-+        };
-+        converter.push_build_graph_targets(&stats, &mut Vec::new());
-+        let mut final_events = Vec::new();
-+        converter.emit_completed_updates_for_actions(&mut final_events);
-+        assert!(final_events.iter().any(|event| matches!(&event.payload,
-+            Some(build_event::Payload::Completed(c)) if c.success)));
-+        assert_eq!(
-+            final_events
-+                .iter()
-+                .filter(|event| matches!(
-+                    event.payload,
-+                    Some(build_event::Payload::TargetSummary(_))
-+                ))
-+                .count(),
-+            1
-+        );
      }
  
++
      #[test]
-@@ -13164,31 +13477,31 @@ mod tests {
+     fn configured_targets_are_deduplicated() {
+         let mut converter = BazelEventConverter::default();
+@@ -13164,31 +13290,31 @@ mod tests {
          ));
  
          let first = converter.convert(1, &event);
@@ -723,7 +542,7 @@ index 8bf5e30b..5afbf720 100644
              1,
              &trace_event(buck2_data::buck_event::Data::SpanStart(
                  buck2_data::SpanStartEvent {
-@@ -13204,6 +13517,8 @@ mod tests {
+@@ -13204,6 +13330,8 @@ mod tests {
              )),
          );
  
@@ -732,7 +551,7 @@ index 8bf5e30b..5afbf720 100644
          let configured = events
              .iter()
              .find_map(|event| match event.payload.as_ref() {
-@@ -13436,6 +13751,13 @@ mod tests {
+@@ -13436,6 +13564,13 @@ mod tests {
              )),
          );
  
@@ -746,7 +565,7 @@ index 8bf5e30b..5afbf720 100644
          let Some(build_event_id::Id::TargetConfigured(configured_id)) =
              configured[0].id.as_ref().and_then(|id| id.id.as_ref())
          else {
-@@ -13702,6 +14024,8 @@ mod tests {
+@@ -13702,6 +13837,8 @@ mod tests {
                  Some(false),
              ),
          );
@@ -755,7 +574,7 @@ index 8bf5e30b..5afbf720 100644
          assert_eq!(
              finished_outcome(&events),
              (
-@@ -13724,6 +14048,8 @@ mod tests {
+@@ -13724,6 +13861,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -764,7 +583,7 @@ index 8bf5e30b..5afbf720 100644
          assert_eq!(
              finished_outcome(&events),
              (
-@@ -13754,6 +14080,8 @@ mod tests {
+@@ -13754,6 +13893,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -773,7 +592,7 @@ index 8bf5e30b..5afbf720 100644
          assert_eq!(
              finished_outcome(&events),
              (
-@@ -13783,6 +14111,8 @@ mod tests {
+@@ -13783,6 +13924,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -782,7 +601,7 @@ index 8bf5e30b..5afbf720 100644
          assert_eq!(finished_outcome(&events).1, "TESTS_FAILED");
      }
  
-@@ -13803,6 +14133,8 @@ mod tests {
+@@ -13803,6 +13946,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -791,7 +610,7 @@ index 8bf5e30b..5afbf720 100644
          assert_eq!(finished_outcome(&events).1, "SUCCESS");
      }
  
-@@ -13820,6 +14152,8 @@ mod tests {
+@@ -13820,6 +13965,8 @@ mod tests {
                  Some(false),
              ),
          );

@@ -16,7 +16,7 @@ successful command did not build closes as Aborted, SKIPPED.
  1 file changed, 362 insertions(+), 9 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
-index eb822dbc..1ba5e1be 100644
+index 948fa6dc..d9f311bd 100644
 --- a/app/buck2_events/src/sink/bazel_converter.rs
 +++ b/app/buck2_events/src/sink/bazel_converter.rs
 @@ -60,6 +60,51 @@ struct TargetKey {
@@ -286,7 +286,7 @@ index eb822dbc..1ba5e1be 100644
  fn completed_event(label: String, configuration: String, success: bool) -> bep::BuildEvent {
      completed_event_with_children(label, configuration, success, Vec::new())
  }
-@@ -13594,6 +13737,216 @@ mod tests {
+@@ -13407,6 +13550,216 @@ mod tests {
          );
      }
  

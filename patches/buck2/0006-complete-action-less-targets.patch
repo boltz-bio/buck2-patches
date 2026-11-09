@@ -14,7 +14,7 @@ the command finishes. Analysis-only commands complete nothing.
  1 file changed, 135 insertions(+), 2 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
-index 5afbf720..eb822dbc 100644
+index 3c28fc3e..948fa6dc 100644
 --- a/app/buck2_events/src/sink/bazel_converter.rs
 +++ b/app/buck2_events/src/sink/bazel_converter.rs
 @@ -1270,6 +1270,13 @@ pub(crate) struct BazelEventConverter {
@@ -95,9 +95,9 @@ index 5afbf720..eb822dbc 100644
          let mut configured = Vec::new();
          self.flush_analyzed_configured_events(&mut configured);
          self.prepare_completed_targets(&mut configured);
-@@ -13461,6 +13493,107 @@ mod tests {
-         );
+@@ -13274,6 +13306,107 @@ mod tests {
      }
+ 
  
 +    #[test]
 +    fn target_completion_finishes_action_less_targets_of_a_build() {

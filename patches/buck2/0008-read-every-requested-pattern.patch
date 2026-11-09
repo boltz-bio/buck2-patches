@@ -16,7 +16,7 @@ still cut short as naming every target.
  2 files changed, 145 insertions(+), 33 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
-index 1ba5e1be..f8a9ec6a 100644
+index d9f311bd..18853bce 100644
 --- a/app/buck2_events/src/sink/bazel_converter.rs
 +++ b/app/buck2_events/src/sink/bazel_converter.rs
 @@ -13,6 +13,7 @@
@@ -156,7 +156,7 @@ index 1ba5e1be..f8a9ec6a 100644
      }
  
      /// A successful command closes each requested target it neither built nor tested as skipped,
-@@ -13739,20 +13790,55 @@ mod tests {
+@@ -13552,20 +13603,55 @@ mod tests {
  
      #[test]
      fn requested_patterns_match_targets_packages_and_directories() {
