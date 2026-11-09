@@ -125,15 +125,15 @@ jobs:
           # Upstream's release flags (.github/workflows/build_buck2.yml).
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
         run: cargo build --release --bin buck2 --target ${{ matrix.triple }}
-      # The converter and sink tests the patches add, built with the release
-      # flags so they reuse the release build's dependencies.
+      # Mercury's converter tests, built with the release flags so they reuse
+      # the release build's dependencies.
       - name: Test the Bazel converter
         if: runner.os == 'Linux'
         working-directory: buck2
         env:
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
         run: |
-          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter sink::smart_truncate_event
+          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter
       - name: Print the version
         run: buck2/target/${{ matrix.triple }}/release/buck2 --version
       # As upstream's release workflow checks each binary it builds.

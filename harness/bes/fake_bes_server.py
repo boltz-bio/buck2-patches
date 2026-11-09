@@ -76,29 +76,9 @@ def main() -> None:
             "bazel_payload": event.WhichOneof("payload"),
             "last_message": event.last_message,
         }
-        fields["event_id_bytes"] = event.id.SerializeToString().hex()
-        fields["children_id_bytes"] = [child.SerializeToString().hex() for child in event.children]
-        if event.HasField("target_summary"):
-            fields["overall_build_success"] = event.target_summary.overall_build_success
-        if event.HasField("build_tool_logs"):
-            fields["log_names"] = [item.name for item in event.build_tool_logs.log]
-            for item in event.build_tool_logs.log:
-                if item.name == "buck2-invocation.json" and item.WhichOneof("file") == "contents":
-                    fields["invocation_json_keys"] = sorted(json.loads(item.contents).keys())
         if event.HasField("finished"):
             fields["exit_code"] = event.finished.exit_code.code
             fields["exit_name"] = event.finished.exit_code.name
-        if event.id.HasField("target_configured"):
-            fields["label"] = event.id.target_configured.label
-        if event.id.HasField("target_completed"):
-            fields["label"] = event.id.target_completed.label
-            fields["configuration"] = event.id.target_completed.configuration.id
-        if event.HasField("aborted"):
-            fields["aborted_reason"] = build_event_stream_pb2.Aborted.AbortReason.Name(
-                event.aborted.reason
-            )
-        if event.HasField("completed"):
-            fields["completed_success"] = event.completed.success
         if event.id.HasField("test_result"):
             fields["label"] = event.id.test_result.label
         if event.id.HasField("test_summary"):

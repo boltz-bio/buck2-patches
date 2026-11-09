@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/boltz-bio/buck2-patches/actions/workflows/build.yaml/badge.svg)](https://github.com/boltz-bio/buck2-patches/actions/workflows/build.yaml)
 
-[Buck2](https://github.com/meta/buck2) at a pinned upstream commit, with patches for Bazel Build Event Service (BES) reporting. Upstream Buck2 has no BES client, so its builds never appear as BuildBuddy invocations. Patches 0001 to 0004 are Mercury's open upstream pull requests, unchanged; 0005 to 0008 are ours, and fix how the Bazel converter reports targets.
+[Buck2](https://github.com/meta/buck2) at a pinned upstream commit, with patches for Bazel Build Event Service (BES) reporting. Upstream Buck2 has no BES client, so its builds never appear as BuildBuddy invocations. The patches are Mercury's four open upstream pull requests, unchanged.
 
 Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, zstd-compressed and named as upstream names them, their sha256s, and the standard prelude from the same upstream commit, which the binaries also bundle.
 
@@ -16,12 +16,8 @@ Each release carries release `buck2` binaries for Linux x86_64 and macOS arm64, 
 | `0002-pr1598-action-names-in-re-metadata.patch` | [meta/buck2#1598](https://github.com/meta/buck2/pull/1598) (open) | Names actions in remote execution request metadata, and records the data a BEP stream needs. |
 | `0003-pr1599-publish-to-bazel-bes.patch` | [meta/buck2#1599](https://github.com/meta/buck2/pull/1599) (open) | Publishes the event stream to a Bazel Build Event Service in open-source builds, configured by the `[bes]` buckconfig section (`docs/users/build_observability/event_system.md`). `event_format = bazel` converts it to Bazel BEP, which BuildBuddy renders. |
 | `0004-pr1600-kill-waits-for-bes-ack.patch` | [meta/buck2#1600](https://github.com/meta/buck2/pull/1600) (open) | Lets `buck2 kill` wait for the BES server to acknowledge the daemon's events (`--bes-drain-timeout`), so a CI job that kills its daemon doesn't lose the end of the stream. |
-| `0005-complete-targets-from-build-and-test-records.patch` | Ours | Completes each target from its action and test results, once, when the invocation is finalized, instead of when its analysis ends; a command with no InvocationRecord is finalized when its stream closes. Without it, BuildBuddy shows a target built before its actions run, and a failed target as built. |
-| `0006-complete-action-less-targets.patch` | Ours | Completes a requested target whose analysis declares no actions when a build, test or install command finishes. Without it, BuildBuddy shows such targets, such as `export_file`s in reference mode, as building forever. |
-| `0007-report-only-requested-targets.patch` | Ours | Gives target events only to the targets a build, test or install command's resolved patterns name, as Bazel does, and closes a requested target a successful command did not build as skipped. Without it, BuildBuddy lists every dependency and shows the cached ones as building. |
-| `0008-read-every-requested-pattern.patch` | Ours | Keeps the TargetPatterns event whole for Bazel conversion, which the sink trims to 512 KiB, and indexes the requested set. Without it, a command naming tens of thousands of targets, as a CI argfile does, loses the target events of all but the first few thousand. |
 
-Patches 0001 to 0004 are `git format-patch` of Mercury's commits, unchanged, from the heads of its stacked pull requests (#1598's head contains #1597's commit, and so on). Mercury's `examples/bes` check (meta/buck2#1616) lives in `harness/bes` instead, outside the engine, with this series' cases.
+Patches 0001 to 0004 are `git format-patch` of Mercury's commits, unchanged, from the heads of its stacked pull requests (#1598's head contains #1597's commit, and so on). Mercury's `examples/bes` check (meta/buck2#1616) lives in `harness/bes` instead, outside the engine.
 
 The pin is `2920a4c3bc` (2026-11-06), the parent of [`b673d4d04a`](https://github.com/meta/buck2/commit/b673d4d04a), "types: The test info providers hold `ValueOf`". The patches still apply after it, but patch 0002's `test_labels` in `app/buck2_test/src/orchestrator.rs` no longer compiles there: `labels()` now yields `Result`s. Bump past it once Mercury rebases #1598, or adapt 0002 here.
 
