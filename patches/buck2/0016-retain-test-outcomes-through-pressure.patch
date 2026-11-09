@@ -13,7 +13,7 @@ Retain outcome and context overflow in a private disk FIFO sharing the replay qu
  2 files changed, 938 insertions(+), 76 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
-index 439efa6..02e196d 100644
+index 439efa6a..02e196de 100644
 --- a/app/buck2_events/src/sink/bes_client.rs
 +++ b/app/buck2_events/src/sink/bes_client.rs
 @@ -12,11 +12,14 @@ use std::collections::HashMap;
@@ -1178,7 +1178,7 @@ index 439efa6..02e196d 100644
                  send_now_tx,
                  counters: counters.dupe(),
 diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
-index 63d7605..6022082 100644
+index 63d7605d..6022082f 100644
 --- a/app/buck2_events/src/sink/scribe.rs
 +++ b/app/buck2_events/src/sink/scribe.rs
 @@ -204,18 +204,14 @@ impl RemoteEventSink {
@@ -1277,7 +1277,7 @@ Compile those fixture helpers only for tests while preserving the production ing
  1 file changed, 2 insertions(+)
 
 diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
-index 02e196d..31132d4 100644
+index 02e196de..31132d4f 100644
 --- a/app/buck2_events/src/sink/bes_client.rs
 +++ b/app/buck2_events/src/sink/bes_client.rs
 @@ -2044,6 +2044,7 @@ struct WorkerState {

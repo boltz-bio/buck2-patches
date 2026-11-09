@@ -1,4 +1,4 @@
-From e440ed0f4a41059fde826555069a4acd874006c2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Build tooling contributors <build-tools@example.com>
 Date: Sat, 7 Nov 2026 13:33:44 +0000
 Subject: [PATCH] test: validate terminal order within each invocation stream
@@ -15,7 +15,7 @@ while retaining loss, order, acknowledgement and queue-bound checks.
  1 file changed, 145 insertions(+), 35 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
-index 5376662..439efa6 100644
+index 53766621..439efa6a 100644
 --- a/app/buck2_events/src/sink/bes_client.rs
 +++ b/app/buck2_events/src/sink/bes_client.rs
 @@ -4723,6 +4723,13 @@ mod tests {
@@ -268,6 +268,3 @@ index 5376662..439efa6 100644
              assert_eq!(
                  counters.snapshot().dropped,
                  1,
--- 
-2.53.0
-

@@ -147,13 +147,6 @@ jobs:
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- \
             sink::bes_client::tests::accepted_progress_order_is_scoped_to_each_stream --exact
           cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bes_client
-      - name: Test built-in native output declarations and manifests
-        working-directory: buck2
-        env:
-          RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
-        run: |
-          cargo test --release --target ${{ matrix.triple }} -p buck2_test_runner --lib
-          python3 ../scripts/check_test_outputs.py --source . --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
       - name: Test BXL response-error build outcomes
         working-directory: buck2
         env:

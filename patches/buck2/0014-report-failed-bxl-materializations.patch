@@ -1,4 +1,4 @@
-From 2da4fd34a93c3bcb4906c27c7e5b0d0aab150278 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Build tooling contributors <build-tools@example.com>
 Date: Sat, 7 Nov 2026 12:25:15 +0000
 Subject: [PATCH] fix: report failed BXL materializations in build outcomes
@@ -19,7 +19,7 @@ successful and failed anonymous actions against a local event service.
  create mode 100644 examples/bes/check_bxl_outcome.py
 
 diff --git a/app/buck2_bxl/src/command.rs b/app/buck2_bxl/src/command.rs
-index 4b18a97..0d8a4a3 100644
+index 4b18a973..0d8a4a34 100644
 --- a/app/buck2_bxl/src/command.rs
 +++ b/app/buck2_bxl/src/command.rs
 @@ -92,6 +92,12 @@ impl ServerCommandTemplate for BxlServerCommand {
@@ -71,7 +71,7 @@ index 4b18a97..0d8a4a3 100644
          let target =
 diff --git a/examples/bes/bxl_outcome.bxl b/examples/bes/bxl_outcome.bxl
 new file mode 100644
-index 0000000..e7c226b
+index 00000000..e7c226b3
 --- /dev/null
 +++ b/examples/bes/bxl_outcome.bxl
 @@ -0,0 +1,19 @@
@@ -96,7 +96,7 @@ index 0000000..e7c226b
 +failing = bxl.main(impl = _fail, cli_args = {})
 diff --git a/examples/bes/check_bxl_outcome.py b/examples/bes/check_bxl_outcome.py
 new file mode 100644
-index 0000000..1481b7d
+index 00000000..1481b7d9
 --- /dev/null
 +++ b/examples/bes/check_bxl_outcome.py
 @@ -0,0 +1,45 @@
@@ -145,6 +145,3 @@ index 0000000..1481b7d
 +
 +if __name__ == "__main__":
 +    main()
--- 
-2.53.0
-

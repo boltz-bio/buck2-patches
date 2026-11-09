@@ -17,7 +17,7 @@ start deadline.
  2 files changed, 223 insertions(+), 6 deletions(-)
 
 diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
-index f71cc03..c6eca5f 100644
+index f71cc032..c6eca5fa 100644
 --- a/app/buck2_events/src/sink/bes_client.rs
 +++ b/app/buck2_events/src/sink/bes_client.rs
 @@ -240,6 +240,10 @@ pub struct Message {
@@ -250,7 +250,7 @@ index f71cc03..c6eca5f 100644
      async fn a_drain_closes_a_finished_command_and_waits_for_a_server_that_acks_at_eof() {
          let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
 diff --git a/app/buck2_events/src/sink/scribe.rs b/app/buck2_events/src/sink/scribe.rs
-index 3d990ac..63d7605 100644
+index 3d990acd..63d7605d 100644
 --- a/app/buck2_events/src/sink/scribe.rs
 +++ b/app/buck2_events/src/sink/scribe.rs
 @@ -120,6 +120,17 @@ impl RemoteEventSink {

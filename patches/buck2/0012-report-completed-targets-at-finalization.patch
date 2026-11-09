@@ -9,20 +9,83 @@ repeated final updates can replace target results and diagnostic logs.
 Retain analysis metadata and finalize actual outcomes once. Preserve late
 client records when supplied and close ended streams through the existing
 quiet-period and shutdown boundaries when no final record arrives.
+
+As Bazel does, report target events only for the targets a build, test or
+install command requested, those its ParsedTargetPatterns match; announce a
+dependency's action events with the next progress event. A requested target
+whose analysis declares no actions completes when the command finishes, and
+one that a successful command did not build closes as Aborted, SKIPPED. A
+failed command closes neither.
 ---
- app/buck2_events/src/sink/bazel_converter.rs | 534 +++++++++++++++----
- app/buck2_events/src/sink/bes_client.rs      |  94 +++-
- examples/bes/analysis.bxl                    |   6 +
- examples/bes/check.py                        |  41 +-
- examples/bes/fake_bes_server.py              |   9 +
- 5 files changed, 564 insertions(+), 120 deletions(-)
+ app/buck2_events/src/sink/bazel_converter.rs | 1038 ++++++++++++++++--
+ app/buck2_events/src/sink/bes_client.rs      |   94 +-
+ examples/bes/BUCK                            |   35 +
+ examples/bes/README.md                       |    6 +
+ examples/bes/analysis.bxl                    |    6 +
+ examples/bes/check.py                        |   92 +-
+ examples/bes/data.txt                        |    1 +
+ examples/bes/fake_bes_server.py              |   20 +
+ 8 files changed, 1163 insertions(+), 129 deletions(-)
  create mode 100644 examples/bes/analysis.bxl
+ create mode 100644 examples/bes/data.txt
 
 diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
-index 71334ae..1f91b52 100644
+index 71334ae1..4553be8d 100644
 --- a/app/buck2_events/src/sink/bazel_converter.rs
 +++ b/app/buck2_events/src/sink/bazel_converter.rs
-@@ -1233,14 +1233,13 @@ pub(crate) struct BazelEventConverter {
+@@ -65,6 +65,51 @@ struct TargetKey {
+     configuration: String,
+ }
+ 
++/// A resolved target pattern that a build, test or install command requested: one target, every
++/// target in a package (`//pkg:`), or every target under a directory (`//pkg/...`).
++#[derive(Clone, Debug, Eq, PartialEq)]
++enum RequestedPattern {
++    Target(String),
++    Package(String),
++    Recursive(String),
++}
++
++impl RequestedPattern {
++    fn parse(pattern: &str) -> Option<Self> {
++        // A provider (`[name]`) or configuration (`?platform`) suffix narrows what the command
++        // builds of a target, not which target it requests.
++        let pattern = pattern.split(['[', '?']).next()?.trim();
++        let label = normalize_buck_label(pattern)?;
++        if let Some(base) = label.strip_suffix("...") {
++            let base = base
++                .strip_suffix('/')
++                .filter(|base| !base.ends_with('/'))
++                .unwrap_or(base);
++            return Some(Self::Recursive(base.to_owned()));
++        }
++        if let Some(package) = label.strip_suffix(':') {
++            return Some(Self::Package(package.to_owned()));
++        }
++        if !label.contains(':') {
++            // `//a/b` is `//a/b:b`.
++            let name = label.rsplit('/').next().unwrap_or_default().to_owned();
++            return Some(Self::Target(format!("{label}:{name}")));
++        }
++        Some(Self::Target(label))
++    }
++
++    fn matches(&self, label: &str) -> bool {
++        let package = label.split_once(':').map_or(label, |(package, _)| package);
++        match self {
++            Self::Target(target) => target == label,
++            Self::Package(base) => base == package,
++            Self::Recursive(base) => package
++                .strip_prefix(base.as_str())
++                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || base.ends_with('/')),
++        }
++    }
++}
++
+ #[derive(Clone, Debug)]
+ struct CompletedTargetState {
+     success: bool,
+@@ -1233,14 +1278,13 @@ pub(crate) struct BazelEventConverter {
      completed_targets: BTreeMap<TargetKey, CompletedTargetState>,
      action_children: BTreeMap<TargetKey, BTreeMap<String, bep::BuildEventId>>,
      test_children: BTreeMap<TargetKey, BTreeMap<String, bep::BuildEventId>>,
@@ -39,7 +102,31 @@ index 71334ae..1f91b52 100644
      emitted_completed_targets: BTreeSet<TargetKey>,
      test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
      held_test_ends: BTreeMap<TargetKey, HeldTestEnd>,
-@@ -1369,7 +1368,9 @@ impl BazelEventConverter {
+@@ -1279,6 +1323,23 @@ pub(crate) struct BazelEventConverter {
+     /// buck2's own exit code when the build had no errors.
+     test_executor_exit_code: Option<i32>,
+     saw_failing_test_result: bool,
++    /// Configured targets whose analysis declared no actions, such as `export_file` or a
++    /// source set. No action event completes them, so a command that builds what it analyses
++    /// completes them when it finishes.
++    action_less_targets: BTreeSet<TargetKey>,
++    /// Whether the command builds the targets it analyses (build, test, install), unlike
++    /// analysis-only commands such as cquery or BXL.
++    builds_analyzed_targets: bool,
++    /// The resolved target patterns of a build, test or install command. As Bazel reports only
++    /// its top-level targets, only the targets these match get target events; a dependency gets
++    /// none. Without them, every analysed target does.
++    requested_patterns: Option<Vec<RequestedPattern>>,
++    /// Requested targets that a successful command did not build, such as the non-test targets
++    /// of `buck2 test` without `--build-default-info`. Each closes as skipped.
++    skipped_targets: BTreeSet<TargetKey>,
++    /// Action events of targets that get no target events of their own, announced by the next
++    /// progress event, as Bazel announces events no other event names.
++    unowned_action_children: Vec<bep::BuildEventId>,
+ }
+ 
+ impl BazelEventConverter {
+@@ -1369,7 +1430,9 @@ impl BazelEventConverter {
              );
          }
  
@@ -50,13 +137,26 @@ index 71334ae..1f91b52 100644
          self.record_event_graph(&events);
          if finishes_invocation {
              self.emit_aborted_events_for_missing_ids(&mut events);
-@@ -1421,7 +1422,13 @@ impl BazelEventConverter {
+@@ -1400,8 +1463,9 @@ impl BazelEventConverter {
+                     &self.build_metadata,
+                 )));
+                 self.remember_cli_target_patterns(command);
+-                self.defer_target_setup_until_first_result =
+-                    is_test_or_coverage_command(&command_name(command));
++                let name = command_name(command);
++                self.defer_target_setup_until_first_result = is_test_or_coverage_command(&name);
++                self.builds_analyzed_targets = matches!(name.as_str(), "build" | "test" | "install");
+                 events.push(unstructured_command_line_event(command));
+                 events.push(original_structured_command_line_event(command));
+                 events.push(canonical_structured_command_line_event(command));
+@@ -1421,7 +1485,14 @@ impl BazelEventConverter {
                  }
              }
              Some(buck2_data::span_start_event::Data::Analysis(analysis)) => {
 -                self.push_configured_event(configured_event_from_analysis_start(analysis), events);
 +                if let Some(target) = configured_target_from_analysis_start(analysis)
 +                    && let Some(key) = target_key_for(target)
++                    && self.is_requested(&key.label)
 +                    && let Some(event) = configured_event_from_analysis_start(analysis)
 +                {
 +                    self.configured_target_labels.insert(key.label.clone());
@@ -65,7 +165,7 @@ index 71334ae..1f91b52 100644
              }
              Some(buck2_data::span_start_event::Data::TestDiscovery(test_discovery)) => {
                  self.remember_test_tags(
-@@ -1461,21 +1468,18 @@ impl BazelEventConverter {
+@@ -1461,35 +1532,36 @@ impl BazelEventConverter {
              Some(buck2_data::span_end_event::Data::Command(command)) => {
                  self.push_all_held_test_events(events);
                  self.emit_pending_pattern_expanded(&[], events, true);
@@ -94,7 +194,18 @@ index 71334ae..1f91b52 100644
              }
              Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
                  if let Some(declared_actions) = analysis.declared_actions {
-@@ -1487,9 +1491,6 @@ impl BazelEventConverter {
+                     self.declared_actions_count =
+                         self.declared_actions_count.saturating_add(declared_actions);
+                 }
++                if analysis.declared_actions == Some(0)
++                    && let Some(buck2_data::analysis_end::Target::StandardTarget(target)) =
++                        analysis.target.as_ref()
++                    && let Some(key) = target_key_for(target)
++                {
++                    self.action_less_targets.insert(key);
++                }
+                 if let Some(declared_artifacts) = analysis.declared_artifacts {
+                     self.declared_artifacts_count = self
                          .declared_artifacts_count
                          .saturating_add(declared_artifacts);
                  }
@@ -104,7 +215,30 @@ index 71334ae..1f91b52 100644
              }
              Some(buck2_data::span_end_event::Data::LoadPackage(load)) => {
                  if !load.path.is_empty() {
-@@ -1778,9 +1779,15 @@ impl BazelEventConverter {
+@@ -1537,8 +1609,12 @@ impl BazelEventConverter {
+                 }
+                 if !self.skip_successful_action_events || action.failed {
+                     if let Some(action_event) = action_event(event, span_end, action) {
+-                        self.remember_action(&action_event);
+-                        self.remember_target_outputs(action);
++                        if action_target_key(action).is_none_or(|key| self.is_requested(&key.label)) {
++                            self.remember_action(&action_event);
++                            self.remember_target_outputs(action);
++                        } else {
++                            self.unowned_action_children.extend(action_event.id.clone());
++                        }
+                         events.push(action_event);
+                     }
+                 } else if let Some(key) = action_target_key(action) {
+@@ -1651,6 +1727,7 @@ impl BazelEventConverter {
+                 }
+             }
+             Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
++                self.remember_requested_patterns(patterns);
+                 self.remember_target_patterns(patterns);
+             }
+             Some(buck2_data::instant_event::Data::TargetCfg(cfg)) => {
+@@ -1778,9 +1855,24 @@ impl BazelEventConverter {
      ) {
          match record.data.as_ref() {
              Some(buck2_data::record_event::Data::InvocationRecord(record)) => {
@@ -112,6 +246,15 @@ index 71334ae..1f91b52 100644
                  self.remember_invocation_target_patterns(record);
                  self.emit_invocation_command_context(event, record, events);
 +                self.push_all_held_test_events(events);
++                if self.requested_patterns.is_none()
++                    && let Some(patterns) = record.parsed_target_patterns.as_ref()
++                {
++                    self.remember_requested_patterns(patterns);
++                }
++                self.complete_action_less_targets();
++                self.close_unbuilt_requested_targets(
++                    record.outcome == Some(buck2_data::InvocationOutcome::Success as i32),
++                );
 +                let mut configured = Vec::new();
 +                self.flush_analyzed_configured_events(&mut configured);
 +                self.prepare_completed_targets(&mut configured);
@@ -120,7 +263,7 @@ index 71334ae..1f91b52 100644
                  self.emit_completed_updates_for_actions(events);
                  events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
                  self.push_convenience_symlinks_identified(&[], events);
-@@ -2047,7 +2054,7 @@ impl BazelEventConverter {
+@@ -2047,7 +2139,7 @@ impl BazelEventConverter {
                  configured_target_children_from_build_targets(targets)
              };
          }
@@ -129,16 +272,93 @@ index 71334ae..1f91b52 100644
              children = configured_target_children_from_labels(&self.configured_target_labels);
          }
          if children.is_empty()
-@@ -2370,38 +2377,78 @@ impl BazelEventConverter {
+@@ -2301,10 +2393,10 @@ impl BazelEventConverter {
+     ) -> bep::BuildEvent {
+         let opaque_count = self.progress_count;
+         self.progress_count = self.progress_count.saturating_add(1);
+-        let children = (opaque_count < i32::MAX)
+-            .then(|| progress_id(opaque_count.saturating_add(1)))
+-            .into_iter()
+-            .collect();
++        let mut children = std::mem::take(&mut self.unowned_action_children);
++        children.extend(
++            (opaque_count < i32::MAX).then(|| progress_id(opaque_count.saturating_add(1))),
++        );
+         bep::BuildEvent {
+             id: Some(progress_id(opaque_count)),
+             children,
+@@ -2321,7 +2413,9 @@ impl BazelEventConverter {
+             return;
+         }
+         self.final_progress_emitted = true;
+-        events.push(final_progress_event(self.progress_count));
++        let mut progress = final_progress_event(self.progress_count);
++        progress.children = std::mem::take(&mut self.unowned_action_children);
++        events.push(progress);
+         self.progress_count = self.progress_count.saturating_add(1);
+     }
+ 
+@@ -2370,38 +2464,147 @@ impl BazelEventConverter {
          );
      }
  
++    fn remember_requested_patterns(&mut self, patterns: &buck2_data::ParsedTargetPatterns) {
++        let parsed = patterns
++            .target_patterns
++            .iter()
++            .filter_map(|pattern| RequestedPattern::parse(&pattern.value))
++            .collect::<Vec<_>>();
++        if !parsed.is_empty() {
++            self.requested_patterns = Some(parsed);
++        }
++    }
++
++    /// Whether a target gets target events: in a build, test or install command, only a target
++    /// its resolved patterns name; in any other command, or before the patterns are known, any.
++    fn is_requested(&self, label: &str) -> bool {
++        !self.builds_analyzed_targets
++            || self
++                .requested_patterns
++                .as_ref()
++                .is_none_or(|patterns| patterns.iter().any(|pattern| pattern.matches(label)))
++    }
++
++    /// A successful command closes each requested target it neither built nor tested as skipped,
++    /// never as built. A failed command leaves them open, as before.
++    fn close_unbuilt_requested_targets(&mut self, succeeded: bool) {
++        if !succeeded || !self.builds_analyzed_targets || self.requested_patterns.is_none() {
++            return;
++        }
++        let unbuilt = self
++            .analyzed_configured_events
++            .keys()
++            .filter(|key| !self.completed_targets.contains_key(key))
++            .cloned()
++            .collect::<Vec<_>>();
++        self.skipped_targets.extend(unbuilt);
++    }
++
++    /// A target whose analysis declared no actions has nothing left to build once a build or
++    /// test command finishes, so it completes successfully then, instead of staying "building".
++    /// Analysis-only commands complete nothing.
++    fn complete_action_less_targets(&mut self) {
++        let keys = std::mem::take(&mut self.action_less_targets);
++        if !self.builds_analyzed_targets {
++            return;
++        }
++        for key in keys {
++            self.completed_targets
++                .entry(key)
++                .or_insert(CompletedTargetState { success: true });
++        }
++    }
++
 +    fn flush_analyzed_configured_events(&mut self, events: &mut Vec<bep::BuildEvent>) {
 +        for (key, mut event) in std::mem::take(&mut self.analyzed_configured_events) {
 +            if self.emitted_configured_targets.contains_key(&key.label) {
 +                continue;
 +            }
-+            if !self.completed_targets.contains_key(&key) {
++            if !self.completed_targets.contains_key(&key) && !self.skipped_targets.contains(&key) {
 +                event.children.clear();
 +            }
 +            self.push_configured_event(Some(event), events);
@@ -147,7 +367,14 @@ index 71334ae..1f91b52 100644
 +
 +    fn prepare_completed_targets(&mut self, events: &mut Vec<bep::BuildEvent>) {
 +        let mut configured_by_label = BTreeMap::new();
-+        for key in self.completed_targets.keys() {
++        let keys = self
++            .completed_targets
++            .keys()
++            .filter(|key| self.is_requested(&key.label))
++            .chain(&self.skipped_targets)
++            .cloned()
++            .collect::<Vec<_>>();
++        for key in &keys {
 +            let configured = configured_by_label
 +                .entry(key.label.clone())
 +                .or_insert_with(|| {
@@ -184,6 +411,12 @@ index 71334ae..1f91b52 100644
 +        };
 +        let mut events = Vec::new();
 +        self.push_all_held_test_events(&mut events);
++        self.complete_action_less_targets();
++        let succeeded = self
++            .last_finished_signature
++            .as_ref()
++            .is_some_and(|finished| finished.overall_success);
++        self.close_unbuilt_requested_targets(succeeded);
 +        let mut configured = Vec::new();
 +        self.flush_analyzed_configured_events(&mut configured);
 +        self.prepare_completed_targets(&mut configured);
@@ -228,6 +461,11 @@ index 71334ae..1f91b52 100644
 -                && output_count_unchanged
 -            {
 +            if self.emitted_completed_targets.contains(&key) {
++                continue;
++            }
++            if !self.is_requested(&key.label) {
++                // A dependency: its action events were announced by progress events.
++                self.emitted_completed_targets.insert(key);
                  continue;
              }
 +            let children_by_id = self.action_children.get(&key);
@@ -235,7 +473,7 @@ index 71334ae..1f91b52 100644
              let Some(state) = self.completed_targets.get(&key) else {
                  continue;
              };
-@@ -2440,11 +2487,6 @@ impl BazelEventConverter {
+@@ -2440,13 +2643,13 @@ impl BazelEventConverter {
                  state.success,
                  self.target_test_statuses.get(&key).copied(),
              ));
@@ -246,8 +484,15 @@ index 71334ae..1f91b52 100644
 -            self.emitted_output_counts.insert(key.clone(), output_count);
              self.emitted_completed_targets.insert(key);
          }
++        for key in self.skipped_targets.clone() {
++            if self.emitted_completed_targets.insert(key.clone()) {
++                events.push(skipped_completion_event(&key));
++            }
++        }
      }
-@@ -5819,7 +5861,10 @@ fn build_tool_logs_event_from_command_end(
+ 
+     fn remember_target_outputs(&mut self, action: &buck2_data::ActionExecutionEnd) {
+@@ -5819,7 +6022,10 @@ fn build_tool_logs_event_from_command_end(
      if let Some(profile) = profile.command_end_profile_gzip(event, span_end, command, outcome) {
          logs.push(file_with_bytes(COMMAND_PROFILE_NAME, profile));
      }
@@ -259,7 +504,7 @@ index 71334ae..1f91b52 100644
  }
  
  fn build_tool_logs_event_from_invocation(
-@@ -6201,15 +6246,6 @@ fn configured_event_from_analysis_start(
+@@ -6201,15 +6407,6 @@ fn configured_event_from_analysis_start(
      ))
  }
  
@@ -275,7 +520,28 @@ index 71334ae..1f91b52 100644
  fn configured_event_from_test_label(
      label: Option<&buck2_data::ConfiguredTargetLabel>,
      target_kind: &str,
-@@ -6593,6 +6629,7 @@ fn finished_event(
+@@ -6295,6 +6492,20 @@ fn test_size_for_target_kind_and_tags(target_kind: &str, tags: &[String]) -> i32
+         .unwrap_or(bep::TestSize::Medium as i32)
+ }
+ 
++/// The completion of a requested target that the command did not build, as Bazel reports a
++/// skipped target: an Aborted event with reason SKIPPED, never a successful TargetComplete.
++fn skipped_completion_event(key: &TargetKey) -> bep::BuildEvent {
++    bep::BuildEvent {
++        id: Some(target_completed_id(key.label.clone(), key.configuration.clone())),
++        children: Vec::new(),
++        payload: Some(build_event::Payload::Aborted(bep::Aborted {
++            reason: bep::aborted::AbortReason::Skipped as i32,
++            description: "The command requested this target but did not build it.".to_owned(),
++        })),
++        last_message: false,
++    }
++}
++
+ fn completed_event(label: String, configuration: String, success: bool) -> bep::BuildEvent {
+     completed_event_with_children(label, configuration, success, Vec::new())
+ }
+@@ -6593,6 +6804,7 @@ fn finished_event(
      }
  }
  
@@ -283,7 +549,7 @@ index 71334ae..1f91b52 100644
  fn is_build_finished_event(event: &bep::BuildEvent) -> bool {
      matches!(event.payload, Some(build_event::Payload::Finished(_)))
  }
-@@ -7597,7 +7634,6 @@ mod tests {
+@@ -7597,7 +7809,6 @@ mod tests {
      use std::io::Read;
  
      use flate2::read::GzDecoder;
@@ -291,7 +557,7 @@ index 71334ae..1f91b52 100644
  
      use super::*;
  
-@@ -11622,6 +11658,8 @@ mod tests {
+@@ -11622,6 +11833,8 @@ mod tests {
              )),
          );
  
@@ -300,7 +566,7 @@ index 71334ae..1f91b52 100644
          let finished_index = events
              .iter()
              .position(is_build_finished_event)
-@@ -12022,7 +12060,8 @@ mod tests {
+@@ -12022,7 +12235,8 @@ mod tests {
                  ..Default::default()
              }),
          );
@@ -310,7 +576,7 @@ index 71334ae..1f91b52 100644
          let logs = events
              .iter()
              .find_map(|event| match event.payload.as_ref() {
-@@ -12254,23 +12293,6 @@ mod tests {
+@@ -12254,23 +12468,6 @@ mod tests {
          let mut converter = BazelEventConverter::default();
          let target = configured_target_with_package("root//", "main", "cfg");
  
@@ -334,7 +600,7 @@ index 71334ae..1f91b52 100644
          let action = converter.convert(
              2,
              &trace_event(buck2_data::buck_event::Data::SpanEnd(
-@@ -12298,6 +12320,10 @@ mod tests {
+@@ -12298,6 +12495,10 @@ mod tests {
                  },
              )),
          );
@@ -345,7 +611,7 @@ index 71334ae..1f91b52 100644
          let final_events = converter.convert(
              3,
              &trace_event(buck2_data::buck_event::Data::Record(
-@@ -12345,6 +12371,16 @@ mod tests {
+@@ -12345,6 +12546,16 @@ mod tests {
              panic!("expected TargetCompleted id");
          };
          assert_eq!(completed_id.label, "//:main");
@@ -362,7 +628,7 @@ index 71334ae..1f91b52 100644
          assert!(
              completed_update
                  .children
-@@ -12666,6 +12702,26 @@ mod tests {
+@@ -12666,6 +12877,26 @@ mod tests {
              })
              .expect("expected TestSummary event");
          assert_eq!(summary.total_num_cached, 1);
@@ -389,7 +655,7 @@ index 71334ae..1f91b52 100644
      }
  
      fn test_run_end_event(
-@@ -13266,10 +13322,31 @@ mod tests {
+@@ -13266,10 +13497,31 @@ mod tests {
      }
  
      #[test]
@@ -422,7 +688,7 @@ index 71334ae..1f91b52 100644
          let analysis_end = converter.convert(
              1,
              &trace_event(buck2_data::buck_event::Data::SpanEnd(
-@@ -13305,14 +13382,250 @@ mod tests {
+@@ -13305,14 +13557,561 @@ mod tests {
              )),
          );
  
@@ -674,10 +940,321 @@ index 71334ae..1f91b52 100644
 +                .count(),
 +            1
 +        );
++    }
++
++    #[test]
++    fn target_completion_finishes_action_less_targets_of_a_build() {
++        let completed_labels = |command: buck2_data::command_start::Data| {
++            let mut converter = BazelEventConverter::default();
++            converter.convert(
++                0,
++                &trace_event(buck2_data::buck_event::Data::SpanStart(
++                    buck2_data::SpanStartEvent {
++                        data: Some(buck2_data::span_start_event::Data::Command(
++                            buck2_data::CommandStart {
++                                data: Some(command),
++                                ..Default::default()
++                            },
++                        )),
++                    },
++                )),
++            );
++            for (index, (name, declared_actions)) in
++                [("export", 0), ("compiled", 2)].into_iter().enumerate()
++            {
++                let target = configured_target_with_package("root//", name, "cfg");
++                converter.convert(
++                    1 + 2 * index as i64,
++                    &trace_event(buck2_data::buck_event::Data::SpanStart(
++                        buck2_data::SpanStartEvent {
++                            data: Some(buck2_data::span_start_event::Data::Analysis(
++                                buck2_data::AnalysisStart {
++                                    rule: "export_file".to_owned(),
++                                    target: Some(
++                                        buck2_data::analysis_start::Target::StandardTarget(
++                                            target.clone(),
++                                        ),
++                                    ),
++                                },
++                            )),
++                        },
++                    )),
++                );
++                converter.convert(
++                    2 + 2 * index as i64,
++                    &trace_event(buck2_data::buck_event::Data::SpanEnd(
++                        buck2_data::SpanEndEvent {
++                            data: Some(buck2_data::span_end_event::Data::Analysis(
++                                buck2_data::AnalysisEnd {
++                                    rule: "export_file".to_owned(),
++                                    target: Some(
++                                        buck2_data::analysis_end::Target::StandardTarget(target),
++                                    ),
++                                    declared_actions: Some(declared_actions),
++                                    ..Default::default()
++                                },
++                            )),
++                            ..Default::default()
++                        },
++                    )),
++                );
++            }
++            let final_events = converter.convert(
++                5,
++                &trace_event(buck2_data::buck_event::Data::Record(
++                    buck2_data::RecordEvent {
++                        data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
++                            buck2_data::InvocationRecord {
++                                outcome: Some(buck2_data::InvocationOutcome::Success as i32),
++                                ..Default::default()
++                            },
++                        ))),
++                    },
++                )),
++            );
++            final_events
++                .iter()
++                .filter_map(|event| match (
++                    event.id.as_ref().and_then(|id| id.id.as_ref()),
++                    event.payload.as_ref(),
++                ) {
++                    (
++                        Some(build_event_id::Id::TargetCompleted(id)),
++                        Some(build_event::Payload::Completed(completed)),
++                    ) => Some((id.label.clone(), completed.success)),
++                    _ => None,
++                })
++                .collect::<Vec<_>>()
++        };
++
++        assert_eq!(
++            completed_labels(buck2_data::command_start::Data::Build(
++                buck2_data::BuildCommandStart::default()
++            )),
++            vec![("//:export".to_owned(), true)],
++            "a build completes the target with no actions, and not the one whose actions never ran"
++        );
++        assert_eq!(
++            completed_labels(buck2_data::command_start::Data::Bxl(
++                buck2_data::BxlCommandStart::default()
++            )),
++            Vec::<(String, bool)>::new(),
++            "an analysis-only command completes nothing"
++        );
++    }
++
++    #[test]
++    fn requested_patterns_match_targets_packages_and_directories() {
++        let pattern = |value: &str| RequestedPattern::parse(value).expect("pattern parses");
++        assert!(pattern("root//pkg:main").matches("//pkg:main"));
++        assert!(!pattern("root//pkg:main").matches("//pkg:other"));
++        assert!(pattern("root//pkg:main[sub]").matches("//pkg:main"));
++        assert!(pattern("root//pkg:main?root//platforms:linux").matches("//pkg:main"));
++        assert!(pattern("root//pkg").matches("//pkg:pkg"));
++        assert!(pattern("root//pkg:").matches("//pkg:any"));
++        assert!(!pattern("root//pkg:").matches("//pkg/sub:any"));
++        assert!(pattern("root//pkg/...").matches("//pkg:a"));
++        assert!(pattern("root//pkg/...").matches("//pkg/sub:b"));
++        assert!(!pattern("root//pkg/...").matches("//pkgs:c"));
++        assert!(pattern("root//...").matches("//any/where:x"));
++        assert!(!pattern("root//...").matches("@prelude//cxx:x"));
++        assert!(pattern("prelude//cxx/...").matches("@prelude//cxx/tools:x"));
++    }
++
++    #[test]
++    fn only_requested_targets_get_target_events() {
++        let run = |outcome: buck2_data::InvocationOutcome| {
++            let mut converter = BazelEventConverter::default();
++            let mut events = Vec::new();
++            let mut sequence = 0;
++            let mut convert = |converter: &mut BazelEventConverter, data| {
++                sequence += 1;
++                events.extend(converter.convert(sequence, &trace_event(data)));
++            };
++            convert(
++                &mut converter,
++                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
++                    data: Some(buck2_data::span_start_event::Data::Command(
++                        buck2_data::CommandStart {
++                            data: Some(buck2_data::command_start::Data::Build(
++                                buck2_data::BuildCommandStart::default(),
++                            )),
++                            ..Default::default()
++                        },
++                    )),
++                }),
++            );
++            convert(
++                &mut converter,
++                buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
++                    data: Some(buck2_data::instant_event::Data::TargetPatterns(
++                        buck2_data::ParsedTargetPatterns {
++                            target_patterns: vec![buck2_data::TargetPattern {
++                                value: "root//pkg/...".to_owned(),
++                            }],
++                        },
++                    )),
++                }),
++            );
++            // `built` in two configurations, `data` with no actions, `unbuilt` whose actions
++            // never ran, and `lib`, a dependency outside the requested pattern.
++            let targets = [
++                ("root//pkg", "built", "cfg-a", 1, true),
++                ("root//pkg", "built", "cfg-b", 1, true),
++                ("root//pkg", "data", "cfg-a", 0, false),
++                ("root//pkg", "unbuilt", "cfg-a", 2, false),
++                ("root//dep", "lib", "cfg-a", 1, true),
++            ];
++            for (package, name, configuration, declared_actions, runs) in targets {
++                let target = configured_target_with_package(package, name, configuration);
++                convert(
++                    &mut converter,
++                    buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
++                        data: Some(buck2_data::span_start_event::Data::Analysis(
++                            buck2_data::AnalysisStart {
++                                rule: "genrule".to_owned(),
++                                target: Some(buck2_data::analysis_start::Target::StandardTarget(
++                                    target.clone(),
++                                )),
++                            },
++                        )),
++                    }),
++                );
++                convert(
++                    &mut converter,
++                    buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
++                        data: Some(buck2_data::span_end_event::Data::Analysis(
++                            buck2_data::AnalysisEnd {
++                                rule: "genrule".to_owned(),
++                                target: Some(buck2_data::analysis_end::Target::StandardTarget(
++                                    target.clone(),
++                                )),
++                                declared_actions: Some(declared_actions),
++                                ..Default::default()
++                            },
++                        )),
++                        ..Default::default()
++                    }),
++                );
++                if runs {
++                    convert(
++                        &mut converter,
++                        buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
++                            data: Some(buck2_data::span_end_event::Data::ActionExecution(
++                                Box::new(buck2_data::ActionExecutionEnd {
++                                    key: Some(buck2_data::ActionKey {
++                                        key: format!("{name}-{configuration}"),
++                                        owner: Some(buck2_data::action_key::Owner::TargetLabel(
++                                            target,
++                                        )),
++                                        ..Default::default()
++                                    }),
++                                    ..Default::default()
++                                }),
++                            )),
++                            ..Default::default()
++                        }),
++                    );
++                }
++            }
++            convert(
++                &mut converter,
++                buck2_data::buck_event::Data::Record(buck2_data::RecordEvent {
++                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
++                        buck2_data::InvocationRecord {
++                            outcome: Some(outcome as i32),
++                            ..Default::default()
++                        },
++                    ))),
++                }),
++            );
++            events
++        };
++
++        let target_label = |event: &bep::BuildEvent| match event
++            .id
++            .as_ref()
++            .and_then(|id| id.id.as_ref())
++        {
++            Some(build_event_id::Id::TargetConfigured(id)) => Some(id.label.clone()),
++            Some(build_event_id::Id::TargetCompleted(id)) => Some(id.label.clone()),
++            Some(build_event_id::Id::TargetSummary(id)) => Some(id.label.clone()),
++            _ => None,
++        };
++        let completions = |events: &[bep::BuildEvent]| {
++            let mut completions = events
++                .iter()
++                .filter_map(|event| {
++                    let Some(build_event_id::Id::TargetCompleted(id)) =
++                        event.id.as_ref().and_then(|id| id.id.as_ref())
++                    else {
++                        return None;
++                    };
++                    let outcome = match event.payload.as_ref() {
++                        Some(build_event::Payload::Completed(completed)) => {
++                            format!("completed success={}", completed.success)
++                        }
++                        Some(build_event::Payload::Aborted(aborted)) => {
++                            format!("aborted reason={}", aborted.reason)
++                        }
++                        _ => "other".to_owned(),
++                    };
++                    Some((id.label.clone(), id.configuration.as_ref().map_or(String::new(), |c| c.id.clone()), outcome))
++                })
++                .collect::<Vec<_>>();
++            completions.sort();
++            completions
++        };
++
++        let events = run(buck2_data::InvocationOutcome::Success);
++        assert!(
++            events.iter().filter_map(target_label).all(|label| label.starts_with("//pkg:")),
++            "a dependency gets no target events"
++        );
++        let skipped = format!("aborted reason={}", bep::aborted::AbortReason::Skipped as i32);
++        assert_eq!(
++            completions(&events),
++            vec![
++                ("//pkg:built".to_owned(), "cfg-a".to_owned(), "completed success=true".to_owned()),
++                ("//pkg:built".to_owned(), "cfg-b".to_owned(), "completed success=true".to_owned()),
++                ("//pkg:data".to_owned(), "cfg-a".to_owned(), "completed success=true".to_owned()),
++                ("//pkg:unbuilt".to_owned(), "cfg-a".to_owned(), skipped.clone()),
++            ]
++        );
++        let dependency_action = events
++            .iter()
++            .find_map(|event| match event.id.as_ref().and_then(|id| id.id.as_ref()) {
++                Some(build_event_id::Id::ActionCompleted(id)) if id.label == "//dep:lib" => {
++                    event.id.clone()
++                }
++                _ => None,
++            })
++            .expect("the dependency's action is still posted");
++        assert!(
++            events.iter().any(|event| event.children.contains(&dependency_action)),
++            "a progress event announces the dependency's action"
++        );
++        let configured_built = events
++            .iter()
++            .filter(|event| target_label(event).as_deref() == Some("//pkg:built"))
++            .filter(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
++            .last()
++            .expect("the requested target is configured");
++        assert_eq!(
++            configured_built.children.len(),
++            2,
++            "one TargetConfigured announces the completion of both configurations"
++        );
++
++        let failed = run(buck2_data::InvocationOutcome::Failed);
++        assert!(
++            completions(&failed).iter().all(|(label, _, outcome)| label != "//pkg:unbuilt" && outcome != &skipped),
++            "a failed command closes no target as skipped"
++        );
      }
  
      #[test]
-@@ -13331,31 +13644,31 @@ mod tests {
+@@ -13331,31 +14130,31 @@ mod tests {
          ));
  
          let first = converter.convert(1, &event);
@@ -724,7 +1301,7 @@ index 71334ae..1f91b52 100644
              1,
              &trace_event(buck2_data::buck_event::Data::SpanStart(
                  buck2_data::SpanStartEvent {
-@@ -13371,6 +13684,8 @@ mod tests {
+@@ -13371,6 +14170,8 @@ mod tests {
              )),
          );
  
@@ -733,7 +1310,7 @@ index 71334ae..1f91b52 100644
          let configured = events
              .iter()
              .find_map(|event| match event.payload.as_ref() {
-@@ -13603,6 +13918,13 @@ mod tests {
+@@ -13603,6 +14404,13 @@ mod tests {
              )),
          );
  
@@ -747,7 +1324,7 @@ index 71334ae..1f91b52 100644
          let Some(build_event_id::Id::TargetConfigured(configured_id)) =
              configured[0].id.as_ref().and_then(|id| id.id.as_ref())
          else {
-@@ -13869,6 +14191,8 @@ mod tests {
+@@ -13869,6 +14677,8 @@ mod tests {
                  Some(false),
              ),
          );
@@ -756,7 +1333,7 @@ index 71334ae..1f91b52 100644
          assert_eq!(
              finished_outcome(&events),
              (
-@@ -13891,6 +14215,8 @@ mod tests {
+@@ -13891,6 +14701,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -765,7 +1342,7 @@ index 71334ae..1f91b52 100644
          assert_eq!(
              finished_outcome(&events),
              (
-@@ -13921,6 +14247,8 @@ mod tests {
+@@ -13921,6 +14733,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -774,7 +1351,7 @@ index 71334ae..1f91b52 100644
          assert_eq!(
              finished_outcome(&events),
              (
-@@ -13950,6 +14278,8 @@ mod tests {
+@@ -13950,6 +14764,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -783,7 +1360,7 @@ index 71334ae..1f91b52 100644
          assert_eq!(finished_outcome(&events).1, "TESTS_FAILED");
      }
  
-@@ -13970,6 +14300,8 @@ mod tests {
+@@ -13970,6 +14786,8 @@ mod tests {
                  Some(true),
              ),
          );
@@ -792,7 +1369,7 @@ index 71334ae..1f91b52 100644
          assert_eq!(finished_outcome(&events).1, "SUCCESS");
      }
  
-@@ -13987,6 +14319,8 @@ mod tests {
+@@ -13987,6 +14805,8 @@ mod tests {
                  Some(false),
              ),
          );
@@ -802,7 +1379,7 @@ index 71334ae..1f91b52 100644
      }
  }
 diff --git a/app/buck2_events/src/sink/bes_client.rs b/app/buck2_events/src/sink/bes_client.rs
-index c6eca5f..5376662 100644
+index c6eca5fa..53766621 100644
 --- a/app/buck2_events/src/sink/bes_client.rs
 +++ b/app/buck2_events/src/sink/bes_client.rs
 @@ -2452,6 +2452,10 @@ impl WorkerState {
@@ -924,9 +1501,72 @@ index c6eca5f..5376662 100644
      #[tokio::test]
      async fn a_late_test_target_reaches_the_server_announced_with_its_summary() {
          let (endpoint, _streams, bazel_events) =
+diff --git a/examples/bes/BUCK b/examples/bes/BUCK
+index fef24efc..cad9d152 100644
+--- a/examples/bes/BUCK
++++ b/examples/bes/BUCK
+@@ -6,6 +6,41 @@ genrule(
+     cmd = "echo ok > $OUT",
+ )
+ 
++# Declares no actions: a build has nothing to run for it, so no action event completes it.
++export_file(
++    name = "data",
++    src = "data.txt",
++    mode = "reference",
++)
++
++# `uses_dep` depends on `dep`, so a build of `uses_dep` builds `dep` without requesting it.
++genrule(
++    name = "dep",
++    out = "dep.txt",
++    cmd = "echo dep > $OUT",
++)
++
++genrule(
++    name = "uses_dep",
++    out = "uses_dep.txt",
++    cmd = "cat $(location :dep) > $OUT",
++)
++
++# `uses_tool` runs `tool` as an executable, so a build of both builds `tool` for the target
++# and for the execution platform.
++genrule(
++    name = "tool",
++    out = "tool.sh",
++    cmd = "printf '#!/bin/sh\\necho tool\\n' > $OUT && chmod +x $OUT",
++    executable = True,
++)
++
++genrule(
++    name = "uses_tool",
++    out = "uses_tool.txt",
++    cmd = "$(exe :tool) > $OUT",
++)
++
+ genrule(
+     name = "fail",
+     out = "fail.txt",
+diff --git a/examples/bes/README.md b/examples/bes/README.md
+index 4905c61f..e27352f2 100644
+--- a/examples/bes/README.md
++++ b/examples/bes/README.md
+@@ -6,6 +6,12 @@ records every event it receives, and checks what arrived:
+ - a build that succeeds, one that fails, and a test run each stream a complete
+   invocation, from `started` to `build_finished` and the end of the stream,
+   with the right exit code and test statuses;
++- a build of a target that declares no actions completes that target, and an
++  analysis-only BXL script completes none;
++- only the targets a build or test requests get target events: a dependency,
++  built or rebuilt in a new daemon, gets none, a requested target that `buck2 test` does not
++  build closes as skipped, and a target built in more than one configuration
++  is announced once with a completion for each;
+ - `buck2 kill --bes-drain-timeout` delivers a stream that the daemon still held
+   when its command ended, to a server that reads slowly and acknowledges only
+   at the end of a stream.
 diff --git a/examples/bes/analysis.bxl b/examples/bes/analysis.bxl
 new file mode 100644
-index 0000000..d592718
+index 00000000..d5927186
 --- /dev/null
 +++ b/examples/bes/analysis.bxl
 @@ -0,0 +1,6 @@
@@ -937,7 +1577,7 @@ index 0000000..d592718
 +
 +main = bxl.main(impl = _impl, cli_args = {})
 diff --git a/examples/bes/check.py b/examples/bes/check.py
-index 4a93718..746c2d5 100644
+index 4a93718e..0780bec5 100644
 --- a/examples/bes/check.py
 +++ b/examples/bes/check.py
 @@ -105,19 +105,21 @@ class Check:
@@ -986,7 +1626,7 @@ index 4a93718..746c2d5 100644
          )
          self.expect(
              events[-1]["kind"] == "component_stream_finished",
-@@ -199,6 +203,8 @@ def main() -> None:
+@@ -199,15 +203,33 @@ def main() -> None:
      server = Server(work, "acks")
      check.configure(server)
      try:
@@ -995,7 +1635,23 @@ index 4a93718..746c2d5 100644
          rc, build_id = check.run("build", "//:ok")
          check.expect(rc == 0, "`buck2 build //:ok` succeeds")
          build_ok = build_id
-@@ -208,6 +214,8 @@ def main() -> None:
+         rc, build_id = check.run("build", "//:fail")
+         check.expect(rc != 0, "`buck2 build //:fail` fails")
+         build_fail = build_id
++        rc, action_less_id = check.run("build", "//:data")
++        check.expect(rc == 0, "`buck2 build //:data` succeeds")
++        rc, dependency_id = check.run("build", "//:uses_dep")
++        check.expect(rc == 0, "`buck2 build //:uses_dep` succeeds")
++        # A new daemon analyses again, so the converter learns the requested targets; one that
++        # keeps its analysis from an earlier command reports none.
++        check.kill("--bes-drain-timeout=60s")
++        rc, rebuilt_dependency_id = check.run("build", "//:uses_dep")
++        check.expect(rc == 0, "`buck2 build //:uses_dep` in a new daemon succeeds")
++        check.kill("--bes-drain-timeout=60s")
++        rc, unbuilt_id = check.run("test", "//:test_pass", "//:ok")
++        check.expect(rc == 0, "`buck2 test //:test_pass //:ok` succeeds without building `//:ok`")
++        rc, configurations_id = check.run("build", "//:tool", "//:uses_tool")
++        check.expect(rc == 0, "`buck2 build //:tool //:uses_tool` succeeds")
          rc, build_id = check.run("test", "//:test_pass", "//:test_fail")
          check.expect(rc != 0, "`buck2 test` fails, as `//:test_fail` does")
          test = build_id
@@ -1004,13 +1660,50 @@ index 4a93718..746c2d5 100644
          check.kill("--bes-drain-timeout=60s")
      finally:
          server.stop()
-@@ -216,6 +224,29 @@ def main() -> None:
+@@ -216,6 +238,66 @@ def main() -> None:
      check.expect_complete_stream(server.stream(build_ok), exit_ok=True)
      print("A build that fails:")
      check.expect_complete_stream(server.stream(build_fail), exit_ok=False)
 +    summaries = [row for row in server.stream(build_ok) if row.get("bazel_id") == "target_summary"]
 +    check.expect(len(summaries) == 1 and summaries[0].get("overall_build_success"),
 +                 "the real build has one successful target summary")
++    print("A build of a target with no actions:")
++    action_less = server.stream(action_less_id)
++    check.expect_complete_stream(action_less, exit_ok=True)
++    completed = [row for row in action_less if row.get("bazel_id") == "target_completed"]
++    check.expect([(row.get("label"), row.get("completed_success")) for row in completed] == [("//:data", True)],
++                 "the target with no actions completes successfully")
++    posted = {row["event_id_bytes"] for row in action_less if "event_id_bytes" in row}
++    check.expect(all(child in posted
++                     for row in action_less if row.get("bazel_payload") == "configured"
++                     for child in row.get("children_id_bytes", [])),
++                 "every configured target's completion is posted, so none stays building")
++    print("Only requested targets get target events:")
++    for name, build_id in [("built", dependency_id), ("rebuilt", rebuilt_dependency_id)]:
++        recorded = server.stream(build_id)
++        check.expect_complete_stream(recorded, exit_ok=True)
++        labels = {row["label"] for row in recorded
++                  if row.get("bazel_id") in {"target_configured", "target_completed"} and row.get("label")}
++        check.expect(labels == {"//:uses_dep"},
++                     f"a {name} dependency gets no target events (target events for {sorted(labels)})")
++    unbuilt = server.stream(unbuilt_id)
++    check.expect_complete_stream(unbuilt, exit_ok=True)
++    ok_completions = [row for row in unbuilt if row.get("bazel_id") == "target_completed" and row.get("label") == "//:ok"]
++    check.expect(len(ok_completions) == 1 and ok_completions[0].get("aborted_reason") == "SKIPPED",
++                 "a requested target the test command did not build closes as skipped, not built")
++    configurations = server.stream(configurations_id)
++    check.expect_complete_stream(configurations, exit_ok=True)
++    tool_completions = [row for row in configurations
++                        if row.get("bazel_id") == "target_completed" and row.get("label") == "//:tool"]
++    tool_configured = [row for row in configurations
++                       if row.get("bazel_payload") == "configured" and row.get("label") == "//:tool"]
++    print(f"  `//:tool` completed in {len({row.get('configuration') for row in tool_completions})} configuration(s)")
++    check.expect(bool(tool_completions) and all(row.get("completed_success") for row in tool_completions),
++                 "every configuration of `//:tool` completes successfully")
++    check.expect(bool(tool_configured)
++                 and {row["event_id_bytes"] for row in tool_completions}
++                 <= set(tool_configured[-1].get("children_id_bytes", [])),
++                 "one TargetConfigured announces the completion of every configuration")
 +    analysis = server.stream(analysis_id)
 +    check.expect_complete_stream(analysis, exit_ok=True)
 +    check.expect(not any(row.get("bazel_id") in {"target_completed", "target_summary"} for row in analysis),
@@ -1034,7 +1727,7 @@ index 4a93718..746c2d5 100644
      print("A test run:")
      stream = server.stream(test)
      check.expect_complete_stream(stream, exit_ok=False)
-@@ -239,6 +270,8 @@ def main() -> None:
+@@ -239,6 +321,8 @@ def main() -> None:
      server = Server(work, "slow", "--ack-at-eof", "--read-delay=0.1")
      check.configure(server)
      try:
@@ -1043,11 +1736,18 @@ index 4a93718..746c2d5 100644
          rc, build_id = check.run("build", "//:ok")
          check.expect(rc == 0, "`buck2 build //:ok` succeeds")
          output = check.kill("--bes-drain-timeout=120s")
+diff --git a/examples/bes/data.txt b/examples/bes/data.txt
+new file mode 100644
+index 00000000..1269488f
+--- /dev/null
++++ b/examples/bes/data.txt
+@@ -0,0 +1 @@
++data
 diff --git a/examples/bes/fake_bes_server.py b/examples/bes/fake_bes_server.py
-index 3158543..6b4a82b 100644
+index 3158543a..f7b9e7d8 100644
 --- a/examples/bes/fake_bes_server.py
 +++ b/examples/bes/fake_bes_server.py
-@@ -76,6 +76,15 @@ def main() -> None:
+@@ -76,9 +76,29 @@ def main() -> None:
              "bazel_payload": event.WhichOneof("payload"),
              "last_message": event.last_message,
          }
@@ -1063,3 +1763,17 @@ index 3158543..6b4a82b 100644
          if event.HasField("finished"):
              fields["exit_code"] = event.finished.exit_code.code
              fields["exit_name"] = event.finished.exit_code.name
++        if event.id.HasField("target_configured"):
++            fields["label"] = event.id.target_configured.label
++        if event.id.HasField("target_completed"):
++            fields["label"] = event.id.target_completed.label
++            fields["configuration"] = event.id.target_completed.configuration.id
++        if event.HasField("aborted"):
++            fields["aborted_reason"] = build_event_stream_pb2.Aborted.AbortReason.Name(
++                event.aborted.reason
++            )
++        if event.HasField("completed"):
++            fields["completed_success"] = event.completed.success
+         if event.id.HasField("test_result"):
+             fields["label"] = event.id.test_result.label
+         if event.id.HasField("test_summary"):
