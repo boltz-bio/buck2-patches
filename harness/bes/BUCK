@@ -1,0 +1,58 @@
+oncall("build_infra")
+
+genrule(
+    name = "ok",
+    out = "ok.txt",
+    cmd = "echo ok > $OUT",
+)
+
+# Declares no actions: a build has nothing to run for it, so no action event completes it.
+export_file(
+    name = "data",
+    src = "data.txt",
+    mode = "reference",
+)
+
+# `uses_dep` depends on `dep`, so a build of `uses_dep` builds `dep` without requesting it.
+genrule(
+    name = "dep",
+    out = "dep.txt",
+    cmd = "echo dep > $OUT",
+)
+
+genrule(
+    name = "uses_dep",
+    out = "uses_dep.txt",
+    cmd = "cat $(location :dep) > $OUT",
+)
+
+# `uses_tool` runs `tool` as an executable, so a build of both builds `tool` for the target
+# and for the execution platform.
+genrule(
+    name = "tool",
+    out = "tool.sh",
+    cmd = "printf '#!/bin/sh\\necho tool\\n' > $OUT && chmod +x $OUT",
+    executable = True,
+)
+
+genrule(
+    name = "uses_tool",
+    out = "uses_tool.txt",
+    cmd = "$(exe :tool) > $OUT",
+)
+
+genrule(
+    name = "fail",
+    out = "fail.txt",
+    cmd = "echo failing on purpose >&2; exit 1",
+)
+
+sh_test(
+    name = "test_pass",
+    test = "test_pass.sh",
+)
+
+sh_test(
+    name = "test_fail",
+    test = "test_fail.sh",
+)

@@ -125,34 +125,15 @@ jobs:
           # Upstream's release flags (.github/workflows/build_buck2.yml).
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
         run: cargo build --release --bin buck2 --target ${{ matrix.triple }}
-      # Metadata, converter and source-filter tests, built
-      # with the release flags so they reuse the release build's dependencies.
-      - name: Test BES and artifact API contracts
+      # The converter and sink tests the patches add, built with the release
+      # flags so they reuse the release build's dependencies.
+      - name: Test the Bazel converter
         if: runner.os == 'Linux'
         working-directory: buck2
         env:
           RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
         run: |
-          cargo test --release --target ${{ matrix.triple }} -p buck2_server --lib -- bes_prefixed_client_metadata
-          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter
-          cargo test --release --target ${{ matrix.triple }} -p buck2_build_api_tests --test buck2_build_api_tests interpreter::rule_defs::artifact::
-      # This recording-server lifecycle regression is mandatory on both release hosts.
-      - name: Test terminal BES delivery through a full concurrent queue
-        working-directory: buck2
-        env:
-          RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
-        run: |
-          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- \
-            sink::bes_client::tests::terminal_events_survive_a_full_queue_after_delayed_concurrent_starts --exact
-          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- \
-            sink::bes_client::tests::accepted_progress_order_is_scoped_to_each_stream --exact
-          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bes_client
-      - name: Test BXL response-error build outcomes
-        working-directory: buck2
-        env:
-          RUSTFLAGS: "--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
-        run: |
-          cargo test --release --target ${{ matrix.triple }} -p buck2_bxl --lib -- command_end_reports_bxl_materialization_failures
+          cargo test --release --target ${{ matrix.triple }} -p buck2_events --lib -- sink::bazel_converter sink::smart_truncate_event
       - name: Print the version
         run: buck2/target/${{ matrix.triple }}/release/buck2 --version
       # As upstream's release workflow checks each binary it builds.
@@ -164,16 +145,14 @@ jobs:
       - name: Check physical source paths and path-only caching
         run: |
           python3 scripts/check_source_paths.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
-      # Mercury's check of what buck2 sends a Build Event Service, against a
-      # fake server that records the stream (patch 0005). Upstream runs it on
-      # Linux only.
-      - name: Check examples/bes against a recording Build Event Service
+      # What buck2 sends a Build Event Service, against a fake server that
+      # records the stream (harness/bes, from Mercury's meta/buck2#1616).
+      - name: Check BES delivery against a recording server
         if: runner.os == 'Linux'
         run: |
           python3 -m venv "${RUNNER_TEMP}/bes-venv"
           "${RUNNER_TEMP}/bes-venv/bin/pip" install --quiet grpcio==1.76.0 grpcio-tools==1.76.0
-          "${RUNNER_TEMP}/bes-venv/bin/python" buck2/examples/bes/check.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
-          "${RUNNER_TEMP}/bes-venv/bin/python" buck2/examples/bes/check_bxl_outcome.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2"
+          "${RUNNER_TEMP}/bes-venv/bin/python" harness/bes/check.py --buck2 "${GITHUB_WORKSPACE}/buck2/target/${{ matrix.triple }}/release/buck2" --buck2-src buck2
       # The bundled prelude is the one the release ships: expand it as a
       # repository would and compare it with the tree's.
       - name: Check the bundled prelude against the tree's

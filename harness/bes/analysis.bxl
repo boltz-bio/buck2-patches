@@ -1,0 +1,6 @@
+# Analyze a configured target without building it, for BES completion accounting checks.
+
+def _impl(ctx):
+    ctx.analysis(ctx.configured_targets("root//:ok"))
+
+main = bxl.main(impl = _impl, cli_args = {})

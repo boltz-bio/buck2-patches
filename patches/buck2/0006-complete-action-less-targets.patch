@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Demitri Nava <demitri@boltz.bio>
+Date: Mon, 9 Nov 2026 09:04:42 +0000
+Subject: [PATCH] bes: complete requested targets that declare no actions
+
+A target whose analysis declares no actions, such as an export_file in
+reference mode, has no action result to complete it, so BuildBuddy showed it
+as building forever.
+
+In a build, test or install command, complete such a target successfully when
+the command finishes. Analysis-only commands complete nothing.
+---
+ app/buck2_events/src/sink/bazel_converter.rs | 137 ++++++++++++++++++-
+ 1 file changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/app/buck2_events/src/sink/bazel_converter.rs b/app/buck2_events/src/sink/bazel_converter.rs
+index 5afbf720..eb822dbc 100644
+--- a/app/buck2_events/src/sink/bazel_converter.rs
++++ b/app/buck2_events/src/sink/bazel_converter.rs
+@@ -1270,6 +1270,13 @@ pub(crate) struct BazelEventConverter {
+     /// buck2's own exit code when the build had no errors.
+     test_executor_exit_code: Option<i32>,
+     saw_failing_test_result: bool,
++    /// Configured targets whose analysis declared no actions, such as `export_file` or a
++    /// source set. No action event completes them, so a command that builds what it analyses
++    /// completes them when it finishes.
++    action_less_targets: BTreeSet<TargetKey>,
++    /// Whether the command builds the targets it analyses (build, test, install), unlike
++    /// analysis-only commands such as cquery or BXL.
++    builds_analyzed_targets: bool,
+ }
+ 
+ impl BazelEventConverter {
+@@ -1381,8 +1388,9 @@ impl BazelEventConverter {
+                     self.saw_started = true;
+                 }
+                 self.remember_cli_target_patterns(command);
+-                self.defer_target_setup_until_first_result =
+-                    is_test_or_coverage_command(&command_name(command));
++                let name = command_name(command);
++                self.defer_target_setup_until_first_result = is_test_or_coverage_command(&name);
++                self.builds_analyzed_targets = matches!(name.as_str(), "build" | "test" | "install");
+                 events.push(unstructured_command_line_event(command));
+                 events.push(original_structured_command_line_event(command));
+                 events.push(canonical_structured_command_line_event(command));
+@@ -1470,6 +1478,13 @@ impl BazelEventConverter {
+                     self.declared_actions_count =
+                         self.declared_actions_count.saturating_add(declared_actions);
+                 }
++                if analysis.declared_actions == Some(0)
++                    && let Some(buck2_data::analysis_end::Target::StandardTarget(target)) =
++                        analysis.target.as_ref()
++                    && let Some(key) = target_key_for(target)
++                {
++                    self.action_less_targets.insert(key);
++                }
+                 if let Some(declared_artifacts) = analysis.declared_artifacts {
+                     self.declared_artifacts_count = self
+                         .declared_artifacts_count
+@@ -1767,6 +1782,7 @@ impl BazelEventConverter {
+                 self.remember_invocation_target_patterns(record);
+                 self.emit_invocation_command_context(event, record, events);
+                 self.push_all_held_test_events(events);
++                self.complete_action_less_targets();
+                 let mut configured = Vec::new();
+                 self.flush_analyzed_configured_events(&mut configured);
+                 self.prepare_completed_targets(&mut configured);
+@@ -2357,6 +2373,21 @@ impl BazelEventConverter {
+         );
+     }
+ 
++    /// A target whose analysis declared no actions has nothing left to build once a build or
++    /// test command finishes, so it completes successfully then, instead of staying "building".
++    /// Analysis-only commands complete nothing.
++    fn complete_action_less_targets(&mut self) {
++        let keys = std::mem::take(&mut self.action_less_targets);
++        if !self.builds_analyzed_targets {
++            return;
++        }
++        for key in keys {
++            self.completed_targets
++                .entry(key)
++                .or_insert(CompletedTargetState { success: true });
++        }
++    }
++
+     fn flush_analyzed_configured_events(&mut self, events: &mut Vec<bep::BuildEvent>) {
+         for (key, mut event) in std::mem::take(&mut self.analyzed_configured_events) {
+             if self.emitted_configured_targets.contains_key(&key.label) {
+@@ -2408,6 +2439,7 @@ impl BazelEventConverter {
+         };
+         let mut events = Vec::new();
+         self.push_all_held_test_events(&mut events);
++        self.complete_action_less_targets();
+         let mut configured = Vec::new();
+         self.flush_analyzed_configured_events(&mut configured);
+         self.prepare_completed_targets(&mut configured);
+@@ -13461,6 +13493,107 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn target_completion_finishes_action_less_targets_of_a_build() {
++        let completed_labels = |command: buck2_data::command_start::Data| {
++            let mut converter = BazelEventConverter::default();
++            converter.convert(
++                0,
++                &trace_event(buck2_data::buck_event::Data::SpanStart(
++                    buck2_data::SpanStartEvent {
++                        data: Some(buck2_data::span_start_event::Data::Command(
++                            buck2_data::CommandStart {
++                                data: Some(command),
++                                ..Default::default()
++                            },
++                        )),
++                    },
++                )),
++            );
++            for (index, (name, declared_actions)) in
++                [("export", 0), ("compiled", 2)].into_iter().enumerate()
++            {
++                let target = configured_target_with_package("root//", name, "cfg");
++                converter.convert(
++                    1 + 2 * index as i64,
++                    &trace_event(buck2_data::buck_event::Data::SpanStart(
++                        buck2_data::SpanStartEvent {
++                            data: Some(buck2_data::span_start_event::Data::Analysis(
++                                buck2_data::AnalysisStart {
++                                    rule: "export_file".to_owned(),
++                                    target: Some(
++                                        buck2_data::analysis_start::Target::StandardTarget(
++                                            target.clone(),
++                                        ),
++                                    ),
++                                },
++                            )),
++                        },
++                    )),
++                );
++                converter.convert(
++                    2 + 2 * index as i64,
++                    &trace_event(buck2_data::buck_event::Data::SpanEnd(
++                        buck2_data::SpanEndEvent {
++                            data: Some(buck2_data::span_end_event::Data::Analysis(
++                                buck2_data::AnalysisEnd {
++                                    rule: "export_file".to_owned(),
++                                    target: Some(
++                                        buck2_data::analysis_end::Target::StandardTarget(target),
++                                    ),
++                                    declared_actions: Some(declared_actions),
++                                    ..Default::default()
++                                },
++                            )),
++                            ..Default::default()
++                        },
++                    )),
++                );
++            }
++            let final_events = converter.convert(
++                5,
++                &trace_event(buck2_data::buck_event::Data::Record(
++                    buck2_data::RecordEvent {
++                        data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
++                            buck2_data::InvocationRecord {
++                                outcome: Some(buck2_data::InvocationOutcome::Success as i32),
++                                ..Default::default()
++                            },
++                        ))),
++                    },
++                )),
++            );
++            final_events
++                .iter()
++                .filter_map(|event| match (
++                    event.id.as_ref().and_then(|id| id.id.as_ref()),
++                    event.payload.as_ref(),
++                ) {
++                    (
++                        Some(build_event_id::Id::TargetCompleted(id)),
++                        Some(build_event::Payload::Completed(completed)),
++                    ) => Some((id.label.clone(), completed.success)),
++                    _ => None,
++                })
++                .collect::<Vec<_>>()
++        };
++
++        assert_eq!(
++            completed_labels(buck2_data::command_start::Data::Build(
++                buck2_data::BuildCommandStart::default()
++            )),
++            vec![("//:export".to_owned(), true)],
++            "a build completes the target with no actions, and not the one whose actions never ran"
++        );
++        assert_eq!(
++            completed_labels(buck2_data::command_start::Data::Bxl(
++                buck2_data::BxlCommandStart::default()
++            )),
++            Vec::<(String, bool)>::new(),
++            "an analysis-only command completes nothing"
++        );
++    }
++
+     #[test]
+     fn configured_targets_are_deduplicated() {
+         let mut converter = BazelEventConverter::default();

@@ -1,2 +1,4 @@
 # scripts/apply.sh checks upstream out here in CI.
 /buck2/
+harness/bes/buck-out/
+harness/bes/.buckconfig.local
